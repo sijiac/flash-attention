@@ -560,7 +560,7 @@ struct CollectiveMainloopFwdSm80 {
 
         if constexpr (!Share_QV_Smem) { preprocess_Q(); }
 
-        flash::Mask<kBlockM, kBlockN, PackGQA, TiledMma> mask(
+        flash::Mask<kBlockM, kBlockN, PackGQA, TiledMma, SeqlenInfo_t> mask(
             thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, params.sink_token_length,
             params.qhead_per_khead_divmod
         );

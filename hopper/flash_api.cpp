@@ -806,17 +806,20 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         if (q_descale_.has_value()) {
             auto q_descale = q_descale_.value();
             CHECK_DEVICE(q_descale);
-            CHECK_SHAPE(q_descale, batch_size, num_heads_k);
+            // CHECK_SHAPE(q_descale, batch_size, num_heads_k);
             params.q_descale_ptr = q_descale.data_ptr<float>();
             params.q_descale_batch_stride = q_descale.stride(0);
             params.q_descale_head_stride = q_descale.stride(1);
+
+            printf("[HOST] q_batch_stride: %d, head_stride: %d\n\n", q_descale.stride(0), q_descale.stride(1));
+
         } else {
             params.q_descale_ptr = nullptr;
         }
         if (k_descale_.has_value()) {
             auto k_descale = k_descale_.value();
             CHECK_DEVICE(k_descale);
-            CHECK_SHAPE(k_descale, batch_size, num_heads_k);
+            // CHECK_SHAPE(k_descale, batch_size, num_heads_k);
             params.k_descale_ptr = k_descale.data_ptr<float>();
             params.k_descale_batch_stride = k_descale.stride(0);
             params.k_descale_head_stride = k_descale.stride(1);
@@ -826,7 +829,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         if (v_descale_.has_value()) {
             auto v_descale = v_descale_.value();
             CHECK_DEVICE(v_descale);
-            CHECK_SHAPE(v_descale, batch_size, num_heads_k);
+            // CHECK_SHAPE(v_descale, batch_size, num_heads_k);
             params.v_descale_ptr = v_descale.data_ptr<float>();
             params.v_descale_batch_stride = v_descale.stride(0);
             params.v_descale_head_stride = v_descale.stride(1);

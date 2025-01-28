@@ -546,7 +546,7 @@ struct CollectiveMainloopBwdSm80 {
         int const seqlen_q = seqlen_info.seqlen_q;
         int const seqlen_k = seqlen_info.seqlen_k;
 
-        flash::Mask<kBlockM, kBlockN, false /*PackGQA*/, TiledMmaSdP, SdP_swapAB> mask(
+        flash::Mask<kBlockM, kBlockN, false /*PackGQA*/, TiledMmaSdP, SeqlenInfo_t, SdP_swapAB> mask(
             thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, params.sink_token_length,
             params.qhead_per_khead_divmod
         );

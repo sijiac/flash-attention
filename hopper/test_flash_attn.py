@@ -1,6 +1,7 @@
-import os
-import math
+import enum
 import itertools
+import math
+import os
 
 import pytest
 import torch
@@ -9,14 +10,17 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from flash_attn.layers.rotary import apply_rotary_emb
 
-from padding import pad_input, unpad_input
-from test_util import (
-    attention_ref,
-    generate_qkv,
-    generate_random_padding_mask,
+from flash_attn_interface import (
+    flash_attn_combine,
+    flash_attn_func,
+    flash_attn_varlen_func,
+    flash_attn_with_kvcache,
 )
 
-from flash_attn_interface import flash_attn_func, flash_attn_varlen_func, flash_attn_combine, flash_attn_with_kvcache
+from padding import pad_input, unpad_input
+from test_util import attention_ref, generate_qkv, generate_random_padding_mask
+
+from itertools import product
 
 
 DISABLE_BACKWARD = os.getenv("FLASH_ATTENTION_DISABLE_BACKWARD", "FALSE") == "TRUE"
@@ -27,7 +31,10 @@ DISABLE_LOCAL = os.getenv("FLASH_ATTENTION_DISABLE_LOCAL", "FALSE") == "TRUE"
 DISABLE_SOFTCAP = os.getenv("FLASH_ATTENTION_DISABLE_SOFTCAP", "FALSE") == "TRUE"
 DISABLE_PACKGQA = os.getenv("FLASH_ATTENTION_DISABLE_PACKGQA", "FALSE") == "TRUE"
 DISABLE_FP16 = os.getenv("FLASH_ATTENTION_DISABLE_FP16", "FALSE") == "TRUE"
-DISABLE_FP8 = os.getenv("FLASH_ATTENTION_DISABLE_FP8", "FALSE") == "TRUE" or torch.cuda.get_device_capability("cuda")[0] < 9
+DISABLE_FP8 = (
+    os.getenv("FLASH_ATTENTION_DISABLE_FP8", "FALSE") == "TRUE"
+    or torch.cuda.get_device_capability("cuda")[0] < 9
+)
 DISABLE_HDIM64 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM64", "FALSE") == "TRUE"
 DISABLE_HDIM96 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM96", "FALSE") == "TRUE"
 DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128", "FALSE") == "TRUE"
@@ -45,7 +52,12 @@ COMPILED_HDIMS = (
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float16] if not DISABLE_FP16 else []) + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bfloat16]
+    + ([torch.float16] if not DISABLE_FP16 else [])
+    + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []),
+)
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -96,12 +108,23 @@ COMPILED_HDIMS = (
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
 def test_flash_attn_output(
-        seqlen_q, seqlen_k, d, causal, local, softcap, V_colmajor, deterministic, mha_type, dtype
+    seqlen_q,
+    seqlen_k,
+    d,
+    causal,
+    local,
+    softcap,
+    V_colmajor,
+    deterministic,
+    mha_type,
+    dtype,
 ):
     # sink_token_length = 0 if not local else 4
     sink_token_length = 0 if not local else 0
     if V_colmajor and (seqlen_k % 16 != 0 or dtype != torch.float8_e4m3fn):
-        pytest.skip("V_colmajor requires seqlen_k to be a multiple of 16 and dtype to be float8_e4m3fn")
+        pytest.skip(
+            "V_colmajor requires seqlen_k to be a multiple of 16 and dtype to be float8_e4m3fn"
+        )
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
@@ -116,20 +139,36 @@ def test_flash_attn_output(
     q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)
     if softcap > 0.0:
         # Ensure the values of qk are at least within softcap range.
-        q_ref = (q_ref * softcap / 4)
+        q_ref = q_ref * softcap / 4
     q_ref = q_ref.to(dtype).to(dtype_ref).requires_grad_()
-    k_ref = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref).requires_grad_()
-    v_ref = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref).requires_grad_()
+    k_ref = (
+        torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref)
+        .to(dtype)
+        .to(dtype_ref)
+        .requires_grad_()
+    )
+    v_ref = (
+        torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref)
+        .to(dtype)
+        .to(dtype_ref)
+        .requires_grad_()
+    )
     # Put window_size after QKV randn so that window_size changes from test to test
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
     # window_size = (-1, -1) if not local else (16, 0)
     if dtype == torch.float8_e4m3fn:
-        q_descale, k_descale, v_descale = [torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32) * 2 for _ in range(3)]
+        q_descale, k_descale, v_descale = [
+            torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32) * 2
+            for _ in range(3)
+        ]
     else:
         q_descale, k_descale, v_descale = None, None, None
     q, k, v = [x.detach().to(dtype).requires_grad_() for x in (q_ref, k_ref, v_ref)]
     if V_colmajor:
-        v = rearrange(rearrange(v.detach(), "b s h d -> b h d s").contiguous(), "b h d s -> b s h d").requires_grad_()
+        v = rearrange(
+            rearrange(v.detach(), "b s h d -> b h d s").contiguous(),
+            "b h d s -> b s h d",
+        ).requires_grad_()
     out_ref, attn_ref = attention_ref(
         q_ref,
         k_ref,
@@ -137,10 +176,12 @@ def test_flash_attn_output(
         None,
         None,
         causal=causal,
-        q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
         window_size=window_size,
         sink_token_length=sink_token_length,
-        softcap=softcap
+        softcap=softcap,
     )
     out_pt, attn_pt = attention_ref(
         q_ref,
@@ -149,7 +190,9 @@ def test_flash_attn_output(
         None,
         None,
         causal=causal,
-        q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
         window_size=window_size,
         sink_token_length=sink_token_length,
         softcap=softcap,
@@ -179,12 +222,14 @@ def test_flash_attn_output(
             k,
             v,
             causal=causal,
-            q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             window_size=window_size,
             sink_token_length=sink_token_length,
             softcap=softcap,
             pack_gqa=pack_gqa,
-            num_splits=num_splits
+            num_splits=num_splits,
         )
         print(f"Output max diff: {(out - out_ref).abs().max().item()}")
         print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
@@ -194,7 +239,9 @@ def test_flash_attn_output(
 
         # Check that FlashAttention's numerical error is at most twice the numerical error
         # of a Pytorch implementation.
-        assert (out - out_ref).abs().max().item() <= rtol * (out_pt - out_ref).abs().max().item() + fwd_atol
+        assert (out - out_ref).abs().max().item() <= rtol * (
+            out_pt - out_ref
+        ).abs().max().item() + fwd_atol
 
     if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn and not V_colmajor:
         g = torch.randn_like(out)
@@ -247,18 +294,34 @@ def test_flash_attn_output(
         print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
         # breakpoint()
 
-
     if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn and not V_colmajor:
-        dq_atol = 2 * (dq_ref + 0.3 - 0.3 - dq_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
-        assert (dq - dq_ref).abs().max().item() <= rtol * (dq_pt - dq_ref).abs().max().item() + dq_atol
-        dk_atol = 2 * (dk_ref + 0.3 - 0.3 - dk_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
-        assert (dk - dk_ref).abs().max().item() <= rtol * (dk_pt - dk_ref).abs().max().item() + dk_atol
-        dv_atol = 2 * (dv_ref + 0.3 - 0.3 - dv_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
-        assert (dv - dv_ref).abs().max().item() <= rtol * (dv_pt - dv_ref).abs().max().item() + dv_atol
+        dq_atol = 2 * (dq_ref + 0.3 - 0.3 - dq_ref).abs().max().item() + (
+            0 if softcap == 0 else 3e-4
+        )
+        assert (dq - dq_ref).abs().max().item() <= rtol * (
+            dq_pt - dq_ref
+        ).abs().max().item() + dq_atol
+        dk_atol = 2 * (dk_ref + 0.3 - 0.3 - dk_ref).abs().max().item() + (
+            0 if softcap == 0 else 3e-4
+        )
+        assert (dk - dk_ref).abs().max().item() <= rtol * (
+            dk_pt - dk_ref
+        ).abs().max().item() + dk_atol
+        dv_atol = 2 * (dv_ref + 0.3 - 0.3 - dv_ref).abs().max().item() + (
+            0 if softcap == 0 else 3e-4
+        )
+        assert (dv - dv_ref).abs().max().item() <= rtol * (
+            dv_pt - dv_ref
+        ).abs().max().item() + dv_atol
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float16] if not DISABLE_FP16 else []) + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bfloat16]
+    + ([torch.float16] if not DISABLE_FP16 else [])
+    + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []),
+)
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -307,7 +370,16 @@ def test_flash_attn_output(
     ],
 )
 def test_flash_attn_varlen_output(
-    seqlen_q, seqlen_k, d, add_unused_qkv, causal, local, softcap, deterministic, mha_type, dtype
+    seqlen_q,
+    seqlen_k,
+    d,
+    add_unused_qkv,
+    causal,
+    local,
+    softcap,
+    deterministic,
+    mha_type,
+    dtype,
 ):
     device = "cuda"
     # set seed
@@ -325,12 +397,25 @@ def test_flash_attn_varlen_output(
         # Ensure the values of qk are at least within softcap range.
         q_ref = (q_ref * softcap / 4).detach().requires_grad_()
     q_ref = q_ref.to(dtype).to(dtype_ref).requires_grad_()
-    k_ref = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref).requires_grad_()
-    v_ref = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref).requires_grad_()
+    k_ref = (
+        torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref)
+        .to(dtype)
+        .to(dtype_ref)
+        .requires_grad_()
+    )
+    v_ref = (
+        torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref)
+        .to(dtype)
+        .to(dtype_ref)
+        .requires_grad_()
+    )
     # Put window_size after QKV randn so that window_size changes from test to test
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
     if dtype == torch.float8_e4m3fn:
-        q_descale, k_descale, v_descale = [torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32) * 2 for _ in range(3)]
+        q_descale, k_descale, v_descale = [
+            torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32) * 2
+            for _ in range(3)
+        ]
     else:
         q_descale, k_descale, v_descale = None, None, None
     q, k, v = [x.detach().requires_grad_() for x in (q_ref, k_ref, v_ref)]
@@ -376,9 +461,19 @@ def test_flash_attn_varlen_output(
         output_pad_fn,
         dq_pad_fn,
         dk_pad_fn,
-    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False,
-                     query_unused_mask=query_unused_mask, key_unused_mask=key_unused_mask)
-    q_unpad, k_unpad, v_unpad = [x.detach().to(dtype).requires_grad_() for x in (q_unpad, k_unpad, v_unpad)]
+    ) = generate_qkv(
+        q,
+        k,
+        v,
+        query_padding_mask,
+        key_padding_mask,
+        kvpacked=False,
+        query_unused_mask=query_unused_mask,
+        key_unused_mask=key_unused_mask,
+    )
+    q_unpad, k_unpad, v_unpad = [
+        x.detach().to(dtype).requires_grad_() for x in (q_unpad, k_unpad, v_unpad)
+    ]
     out_ref, attn_ref = attention_ref(
         q_ref,
         k_ref,
@@ -386,9 +481,11 @@ def test_flash_attn_varlen_output(
         query_padding_mask,
         key_padding_mask,
         causal=causal,
-        q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
         window_size=window_size,
-        softcap=softcap
+        softcap=softcap,
     )
     out_pt, attn_pt = attention_ref(
         q_ref,
@@ -397,14 +494,15 @@ def test_flash_attn_varlen_output(
         query_padding_mask,
         key_padding_mask,
         causal=causal,
-        q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
         window_size=window_size,
         softcap=softcap,
         upcast=False,
         reorder_ops=True,
         intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
     )
-
 
     print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
@@ -425,12 +523,14 @@ def test_flash_attn_varlen_output(
             v_unpad,
             cu_seqlens_q,
             cu_seqlens_k,
-            seqused_q, seqused_k,
+            seqused_q,
+            seqused_k,
             max_seqlen_q,
             max_seqlen_k,
             causal=causal,
             q_descale=q_descale,
-            k_descale=k_descale, v_descale=v_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             window_size=window_size,
             softcap=softcap,
         )
@@ -445,8 +545,9 @@ def test_flash_attn_varlen_output(
 
         # Check that FlashAttention's numerical error is at most 3x the numerical error
         # of a Pytorch implementation.
-        assert (out - out_ref).abs().max().item() <= rtol * (out_pt - out_ref).abs().max().item() + fwd_atol
-
+        assert (out - out_ref).abs().max().item() <= rtol * (
+            out_pt - out_ref
+        ).abs().max().item() + fwd_atol
 
     if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn:
         g_unpad = torch.randn_like(out_unpad)
@@ -474,7 +575,9 @@ def test_flash_attn_varlen_output(
         #     deterministic,
         #     0,  # sm_margin
         # )
-        dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(out_unpad, (q_unpad, k_unpad, v_unpad), g_unpad)
+        dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(
+            out_unpad, (q_unpad, k_unpad, v_unpad), g_unpad
+        )
         dq = dq_pad_fn(dq_unpad)
         dk = dk_pad_fn(dk_unpad)
         dv = dk_pad_fn(dv_unpad)
@@ -498,7 +601,6 @@ def test_flash_attn_varlen_output(
         # dV = torch.einsum('bhts,bthd->bshd', P, g.float())
         # dK = torch.einsum('bhts,bthd->bshd', dP, q.float())
 
-
         # dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
         dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), g)
         dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g)
@@ -517,16 +619,30 @@ def test_flash_attn_varlen_output(
         # breakpoint()
 
     if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn:
-        dq_atol = 2 * (dq_ref + 0.3 - 0.3 - dq_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
-        assert (dq - dq_ref).abs().max().item() <= rtol * (dq_pt - dq_ref).abs().max().item() + dq_atol
-        dk_atol = 2 * (dk_ref + 0.3 - 0.3 - dk_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
-        assert (dk - dk_ref).abs().max().item() <= rtol * (dk_pt - dk_ref).abs().max().item() + dk_atol
-        dv_atol = 2 * (dv_ref + 0.3 - 0.3 - dv_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
-        assert (dv - dv_ref).abs().max().item() <= rtol * (dv_pt - dv_ref).abs().max().item() + dv_atol
+        dq_atol = 2 * (dq_ref + 0.3 - 0.3 - dq_ref).abs().max().item() + (
+            0 if softcap == 0 else 3e-4
+        )
+        assert (dq - dq_ref).abs().max().item() <= rtol * (
+            dq_pt - dq_ref
+        ).abs().max().item() + dq_atol
+        dk_atol = 2 * (dk_ref + 0.3 - 0.3 - dk_ref).abs().max().item() + (
+            0 if softcap == 0 else 3e-4
+        )
+        assert (dk - dk_ref).abs().max().item() <= rtol * (
+            dk_pt - dk_ref
+        ).abs().max().item() + dk_atol
+        dv_atol = 2 * (dv_ref + 0.3 - 0.3 - dv_ref).abs().max().item() + (
+            0 if softcap == 0 else 3e-4
+        )
+        assert (dv - dv_ref).abs().max().item() <= rtol * (
+            dv_pt - dv_ref
+        ).abs().max().item() + dv_atol
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
+@pytest.mark.parametrize(
+    "dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else [])
+)
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("num_splits", [1] + ([0] if not DISABLE_SPLIT else []))
@@ -536,16 +652,27 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("new_kv", [False] + ([True] if not DISABLE_APPENDKV else []))
 # @pytest.mark.parametrize("new_kv", [True])
 # @pytest.mark.parametrize("local", [False, True])
-@pytest.mark.parametrize("causal,local", [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []))
+@pytest.mark.parametrize(
+    "causal,local",
+    [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []),
+)
 # @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
 # @pytest.mark.parametrize("causal,local", [(False, False)])
-@pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False] if not DISABLE_APPENDKV else [True])
+@pytest.mark.parametrize(
+    "seqlen_new_eq_seqlen_q", [True, False] if not DISABLE_APPENDKV else [True]
+)
 # @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
-@pytest.mark.parametrize("rotary_interleaved", [False, True] if not DISABLE_APPENDKV else [False])
+@pytest.mark.parametrize(
+    "rotary_interleaved", [False, True] if not DISABLE_APPENDKV else [False]
+)
 # @pytest.mark.parametrize("rotary_interleaved", [True])
-@pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0] if not DISABLE_APPENDKV else [0.0])
+@pytest.mark.parametrize(
+    "rotary_fraction", [0.0, 0.5, 1.0] if not DISABLE_APPENDKV else [0.0]
+)
 # @pytest.mark.parametrize("rotary_fraction", [0.0])
-@pytest.mark.parametrize("page_size", [None] + ([1, 4, 128] if not DISABLE_PAGEDKV else []))
+@pytest.mark.parametrize(
+    "page_size", [None] + ([1, 4, 128] if not DISABLE_PAGEDKV else [])
+)
 # @pytest.mark.parametrize("page_size", [None])
 @pytest.mark.parametrize("has_leftpad", [False, True])
 # @pytest.mark.parametrize("has_leftpad", [False])
@@ -614,10 +741,18 @@ def test_flash_attn_kvcache(
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
-    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref)
+    q = (
+        torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)
+        .to(dtype)
+        .to(dtype_ref)
+    )
     if varlen_q:
-        query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, device, mode="random")
-        q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, *rest = unpad_input(q, query_padding_mask)
+        query_padding_mask = generate_random_padding_mask(
+            seqlen_q, batch_size, device, mode="random"
+        )
+        q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, *rest = unpad_input(
+            q, query_padding_mask
+        )
         output_pad_fn = lambda output_unpad: pad_input(
             output_unpad, indices_q, batch_size, seqlen_q
         )
@@ -628,23 +763,55 @@ def test_flash_attn_kvcache(
     # Put window_size after QKV randn so that window_size changes from test to test
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
-    seqlen_new = seqlen_q if seqlen_new_eq_seqlen_q else torch.randint(1, seqlen_q + 1, (1,)).item()
+    seqlen_new = (
+        seqlen_q
+        if seqlen_new_eq_seqlen_q
+        else torch.randint(1, seqlen_q + 1, (1,)).item()
+    )
     cu_seqlens_k_new = None
     key_new_padding_mask = None
     if new_kv:
-        k = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref)
-        v = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref)
+        k = (
+            torch.randn(
+                batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype_ref
+            )
+            .to(dtype)
+            .to(dtype_ref)
+        )
+        v = (
+            torch.randn(
+                batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype_ref
+            )
+            .to(dtype)
+            .to(dtype_ref)
+        )
         if varlen_q:  # k & v are also varlen
-            key_new_padding_mask = generate_random_padding_mask(seqlen_new, batch_size, device, mode="random")
-            k_unpad, indices_k, cu_seqlens_k_new, *rest = unpad_input(k, key_new_padding_mask)
+            key_new_padding_mask = generate_random_padding_mask(
+                seqlen_new, batch_size, device, mode="random"
+            )
+            k_unpad, indices_k, cu_seqlens_k_new, *rest = unpad_input(
+                k, key_new_padding_mask
+            )
             v_unpad, *rest = unpad_input(v, key_new_padding_mask)
         else:
             k_unpad, v_unpad = k, v
     else:
         k, v, k_unpad, v_unpad = None, None, None, None
     if page_size is None:
-        k_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref)
-        v_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref)
+        k_cache = (
+            torch.randn(
+                batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype_ref
+            )
+            .to(dtype)
+            .to(dtype_ref)
+        )
+        v_cache = (
+            torch.randn(
+                batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype_ref
+            )
+            .to(dtype)
+            .to(dtype_ref)
+        )
         page_table = None
     else:
         (
@@ -661,7 +828,11 @@ def test_flash_attn_kvcache(
         0 if new_kv else 1,
         # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
         (
-            (seqlen_k - (seqlen_q if (causal or local) and rotary_dim > 1 else seqlen_new) + 1)
+            (
+                seqlen_k
+                - (seqlen_q if (causal or local) and rotary_dim > 1 else seqlen_new)
+                + 1
+            )
             if new_kv
             else (seqlen_k + 1)
         ),
@@ -670,15 +841,28 @@ def test_flash_attn_kvcache(
         device=device,
     )
     if has_leftpad:
-        cache_leftpad = torch.cat([torch.randint(0, cache_seqlens[i].item(), (1,), dtype=torch.int32, device=device)
-                                   if cache_seqlens[i].item() > 0 else torch.zeros(1, dtype=torch.int32, device=device)
-                                   for i in range(batch_size)])
+        cache_leftpad = torch.cat(
+            [
+                (
+                    torch.randint(
+                        0,
+                        cache_seqlens[i].item(),
+                        (1,),
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    if cache_seqlens[i].item() > 0
+                    else torch.zeros(1, dtype=torch.int32, device=device)
+                )
+                for i in range(batch_size)
+            ]
+        )
     else:
         cache_leftpad = None
     if has_batch_idx:
-        cache_batch_idx = torch.randperm(batch_size_cache, dtype=torch.int32, device=device)[
-            :batch_size
-        ]
+        cache_batch_idx = torch.randperm(
+            batch_size_cache, dtype=torch.int32, device=device
+        )[:batch_size]
     else:
         cache_batch_idx = None
     arange = rearrange(torch.arange(seqlen_k, device=device), "s -> 1 s")
@@ -686,7 +870,9 @@ def test_flash_attn_kvcache(
     if not new_kv:
         key_padding_mask = arange < cache_seqlens_expanded
     else:
-        k_new_seqlens = key_new_padding_mask.sum(-1, keepdims=True) if varlen_q else seqlen_new
+        k_new_seqlens = (
+            key_new_padding_mask.sum(-1, keepdims=True) if varlen_q else seqlen_new
+        )
         key_padding_mask = arange < cache_seqlens_expanded + k_new_seqlens
     if has_leftpad:
         key_padding_mask = torch.logical_and(
@@ -707,7 +893,11 @@ def test_flash_attn_kvcache(
         sin = torch.sin(angle).to(dtype=dtype_ref).to(dtype).to(dtype_ref)
         if causal or local:
             q_ro = apply_rotary_emb(
-                q, cos, sin, seqlen_offsets=cache_seqlens, interleaved=rotary_interleaved
+                q,
+                cos,
+                sin,
+                seqlen_offsets=cache_seqlens,
+                interleaved=rotary_interleaved,
             )
         else:
             q_ro = rearrange(
@@ -733,7 +923,8 @@ def test_flash_attn_kvcache(
     v_cache_ref = (v_cache if not has_batch_idx else v_cache[cache_batch_idx]).clone()
     if new_kv:
         update_mask = torch.logical_and(
-            cache_seqlens_expanded <= arange, arange < cache_seqlens_expanded + k_new_seqlens
+            cache_seqlens_expanded <= arange,
+            arange < cache_seqlens_expanded + k_new_seqlens,
         )
         k_to_update = rearrange(k_ro, "b s ... -> (b s) ...")
         v_to_update = rearrange(v, "b s ... -> (b s) ...")
@@ -765,7 +956,7 @@ def test_flash_attn_kvcache(
         upcast=False,
         reorder_ops=True,
         key_leftpad=cache_leftpad,
-        intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None
+        intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
     )
     q = q.to(dtype)
     q_unpad = q_unpad.to(dtype) if varlen_q else None
@@ -798,7 +989,7 @@ def test_flash_attn_kvcache(
         window_size=window_size,
         rotary_interleaved=rotary_interleaved,
         num_splits=num_splits,
-        return_softmax_lse=True
+        return_softmax_lse=True,
     )
     if varlen_q:
         out = output_pad_fn(out)
@@ -823,19 +1014,31 @@ def test_flash_attn_kvcache(
     if new_kv:
         if page_size is None:
             k_cache_select = (
-                k_cache.to(dtype_ref) if not has_batch_idx else k_cache.to(dtype_ref)[cache_batch_idx]
+                k_cache.to(dtype_ref)
+                if not has_batch_idx
+                else k_cache.to(dtype_ref)[cache_batch_idx]
             )
             v_cache_select = (
-                v_cache.to(dtype_ref) if not has_batch_idx else v_cache.to(dtype_ref)[cache_batch_idx]
+                v_cache.to(dtype_ref)
+                if not has_batch_idx
+                else v_cache.to(dtype_ref)[cache_batch_idx]
             )
         else:
             k_cache_select = rearrange(
-                k_cache_paged.to(dtype_ref)[(page_table if not has_batch_idx else page_table[cache_batch_idx]).flatten()],
+                k_cache_paged.to(dtype_ref)[
+                    (
+                        page_table if not has_batch_idx else page_table[cache_batch_idx]
+                    ).flatten()
+                ],
                 "(b nblocks) block_size ... -> b (nblocks block_size) ...",
                 b=batch_size,
             )[:, :seqlen_k].to(dtype_ref)
             v_cache_select = rearrange(
-                v_cache_paged.to(dtype_ref)[(page_table if not has_batch_idx else page_table[cache_batch_idx]).flatten()],
+                v_cache_paged.to(dtype_ref)[
+                    (
+                        page_table if not has_batch_idx else page_table[cache_batch_idx]
+                    ).flatten()
+                ],
                 "(b nblocks) block_size ... -> b (nblocks block_size) ...",
                 b=batch_size,
             )[:, :seqlen_k].to(dtype_ref)
@@ -857,12 +1060,18 @@ def test_flash_attn_kvcache(
             else:
                 assert torch.allclose(k_cache_select, k_cache_ref, rtol=1e-1, atol=1e-1)
     mult = 4 if dtype == torch.float8_e4m3fn else 2
-    assert (out - out_ref).abs().max().item() <= mult * (out_pt - out_ref).abs().max().item() + 1e-5
+    assert (out - out_ref).abs().max().item() <= mult * (
+        out_pt - out_ref
+    ).abs().max().item() + 1e-5
     mult_mean = 3 if dtype == torch.float8_e4m3fn else 1.5
-    assert (out - out_ref).abs().mean().item() <= mult_mean * (out_pt - out_ref).abs().mean().item()
+    assert (out - out_ref).abs().mean().item() <= mult_mean * (
+        out_pt - out_ref
+    ).abs().mean().item()
 
 
-def _generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, device, dtype):
+def _generate_block_kvcache(
+    seqlen_k, page_size, batch_size, nheads_k, d, device, dtype
+):
     num_blocks = math.ceil(seqlen_k / page_size) * batch_size * 3
     k_cache_paged = torch.randn(
         num_blocks, page_size, nheads_k, d, device=device, dtype=dtype
@@ -891,7 +1100,7 @@ def _generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, device
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize('causal', [False])
-@pytest.mark.parametrize('d', [128])
+@pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -946,12 +1155,20 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, causal, dtype):
     # set seed
     torch.random.manual_seed(0)
     # Simulate under memory load
-    dummy = torch.empty(70 * 1024 ** 3, dtype=torch.uint8, device=device)
-    batch_size = 60  # Sometimes we need large batch size for the race conditions to trigger
+    dummy = torch.empty(70 * 1024**3, dtype=torch.uint8, device=device)
+    batch_size = (
+        60  # Sometimes we need large batch size for the race conditions to trigger
+    )
     nheads = 4
-    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
-    k = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
-    v = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    q = torch.randn(
+        batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True
+    )
+    k = torch.randn(
+        batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True
+    )
+    v = torch.randn(
+        batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True
+    )
     torch.random.manual_seed(42)
     out0, lse0 = flash_attn_func(q, k, v, causal=causal)
     g = torch.randn_like(out0)
@@ -968,7 +1185,9 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, causal, dtype):
         dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
         dq_equal = torch.allclose(dq, dq0, atol=dq_atol)
         if not dq_equal:
-            print(f"Iter {i}, {dq_atol = }, dQ max diff: {(dq - dq0).abs().max().item()}")
+            print(
+                f"Iter {i}, {dq_atol = }, dQ max diff: {(dq - dq0).abs().max().item()}"
+            )
             # breakpoint()
         assert torch.equal(dv, dv0)
         assert torch.equal(dk, dk0)
@@ -982,7 +1201,9 @@ def attention_combine_ref(out_partial, lse_partial):
     """
     lse = torch.logsumexp(lse_partial, dim=0)
     scale = torch.exp(lse_partial - lse)
-    scale = torch.where(torch.isinf(scale) | torch.isnan(scale), torch.zeros_like(scale), scale)
+    scale = torch.where(
+        torch.isinf(scale) | torch.isnan(scale), torch.zeros_like(scale), scale
+    )
     out = (scale.unsqueeze(-1) * out_partial).sum(0)
     return out, lse
 
@@ -1008,10 +1229,24 @@ def test_flash_attn_combine(num_splits, seqlen, d, dtype):
     nheads = 16
     # batch_size = 1
     # nheads = 1
-    out_partial = torch.randn(num_splits * 2, batch_size, nheads, seqlen, d, device=device, dtype=torch.float32).transpose(2, 3)[:num_splits]  # To test non-contiguous tensor
-    lse_partial = torch.randn(num_splits, batch_size, nheads * 2, seqlen, device=device, dtype=torch.float32).transpose(-1, -2)[:, :, :, :nheads]  # To test non-contiguous tensor
+    out_partial = torch.randn(
+        num_splits * 2,
+        batch_size,
+        nheads,
+        seqlen,
+        d,
+        device=device,
+        dtype=torch.float32,
+    ).transpose(2, 3)[
+        :num_splits
+    ]  # To test non-contiguous tensor
+    lse_partial = torch.randn(
+        num_splits, batch_size, nheads * 2, seqlen, device=device, dtype=torch.float32
+    ).transpose(-1, -2)[
+        :, :, :, :nheads
+    ]  # To test non-contiguous tensor
     # To test short-circuiting based on num_splits
-    lse_partial[num_splits // 2:, :batch_size // 3] = -float("inf")
+    lse_partial[num_splits // 2 :, : batch_size // 3] = -float("inf")
     out, lse = flash_attn_combine(out_partial, lse_partial, out_dtype=dtype)
     out_ref, lse_ref = attention_combine_ref(out_partial, lse_partial)
     out_pt = out_ref.to(dtype)
@@ -1026,9 +1261,455 @@ def test_flash_attn_combine(num_splits, seqlen, d, dtype):
 
     assert torch.allclose(lse, lse_ref, atol=1e-5, rtol=1e-5)
     multiple = 2
-    assert ((out - out_ref).abs().max().item() <= multiple * (out_pt - out_ref).abs().max().item()) or torch.allclose(out, out_pt, atol=1e-5, rtol=1e-5)
+    assert (
+        (out - out_ref).abs().max().item()
+        <= multiple * (out_pt - out_ref).abs().max().item()
+    ) or torch.allclose(out, out_pt, atol=1e-5, rtol=1e-5)
 
     # from flash_attn.utils.benchmark import pytorch_profiler
     # # pytorch_profiler(torch.sum, lse_partial)
     # pytorch_profiler(flash_attn_combine, out_partial, lse_partial)
     # pytorch_profiler(torch.sum, out_partial)
+
+
+from typing import Optional, Tuple
+
+import triton.language as tl
+
+
+def get_fp8_constants() -> Tuple[torch.dtype, tl.dtype, float, float]:
+    """
+    Helper function to get constant values for the current platform.
+
+    Returns:
+        pt_dtype (torch.dtype): The correct torch fp8 datatype.
+        tl_dtype (tl.dtype): The correct triton fp8 datatype.
+        max_fp8 (float): The maximum reprsentable value for the fp8 datatype.
+        eps (float): Minimum clip value to prevent divide by zero.
+    """
+    if torch.version.hip is not None:
+        pt_fp8_dtype = torch.float8_e4m3fnuz
+        tl_fp8_dtype = tl.float8e4b8
+    else:
+        pt_fp8_dtype = torch.float8_e4m3fn
+        tl_fp8_dtype = tl.float8e4nv
+    return pt_fp8_dtype, tl_fp8_dtype, torch.finfo(pt_fp8_dtype).max, 1e-12
+
+
+def quantize_fp8_row(
+    a: torch.Tensor,
+    scale_ub: Optional[torch.Tensor] = None,
+    use_triton: bool = True,
+    output_device: Optional[torch.device] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantize a to fp8 with row-wise scalings and optionally move to output device.
+
+    Args:
+        a (Tensor): Input high precision tensor. Required to have no more than 4 dimension
+        scale_ub (Tensor): Maximum allowed value for scale.
+        use_triton (bool): Whether to use triton kernel or pytorch.
+        output_device (torch.device): Device to optionally move the scaled tensors to.
+
+    Returns:
+        torch.Tensor: fp8 scaled tensor.
+        torch.Tensor: The reciprocal scale tensor per row.
+    """
+    # else use pytorch implementation.
+    if not output_device:
+        output_device = a.device
+
+    a_shape = a.shape
+    # Get constants.
+    pt_dtype, _, max_fp8, eps = get_fp8_constants()
+    row_max: torch.Tensor = torch.max(torch.abs(a), dim=-1)[0]
+    # Apply clamping.
+    if scale_ub is not None:
+        row_max = torch.clamp(row_max, min=eps, max=scale_ub.item())
+    else:
+        # pyre-ignore[6]: Incompatible parameter type [6]
+        row_max = torch.clamp(row_max, min=eps)
+    a_scale = torch.empty((a.shape[:-1]), dtype=torch.float32, device=output_device)
+    a_scale = max_fp8 / row_max.to(torch.float32)  # pyre-ignore
+    a_scale[a_scale == float("inf")] = 1.0  # pyre-ignore
+    a_fp8 = a * a_scale[..., None]  # pyre-ignore
+    # Cast and move data to output device (for cpu weight loading).
+    a_fp8 = a_fp8.to(device=output_device, dtype=pt_dtype)
+    a_scale = a_scale.to(output_device)  # pyre-ignore
+    del a
+    return a_fp8, (1 / a_scale).view(a_shape[:-1])  # pyre-ignore
+
+
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
+@pytest.mark.parametrize("mha_type", ["mha"])
+@pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("local", [False])
+@pytest.mark.parametrize("deterministic", [True])
+@pytest.mark.parametrize("gqa_parallel", [False])
+@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        # (1, 1),
+        # (64, 128),
+        # (128, 128),
+        # (256, 256),
+        # (113, 203),
+        # (128, 217),
+        # (113, 211),
+        # (108, 256),
+        # (256, 512),
+        # (384, 256),
+        # (640, 128),
+        # (512, 256),
+        (128, 128),
+        # (1023, 1024),
+        # (1024, 1023),
+        # (4096, 4096),
+        # (4224, 4224),
+    ],
+)
+def test_flash_attn_fp8_rowwise_scaling(
+    seqlen_q,
+    seqlen_k,
+    d,
+    causal,
+    local,
+    deterministic,
+    mha_type,
+    dtype,
+    gqa_parallel,
+):
+    device = "cuda"
+    dtype_init = torch.bfloat16
+    print(dtype)
+    print("causal", causal)
+    print("local", local)
+    print("gqa_parallel", gqa_parallel)
+    # set seed
+    torch.random.manual_seed(42)
+    # batch_size = 40
+    # nheads = 16
+    batch_size = 4
+    nheads = 4
+    nheads_kv = 4 if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
+    # nheads_kv = 1
+    # batch_size = 9
+    # nheads = 6
+    window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
+
+    range_min = -1.0
+    range_max = 1.0
+    _range = range_max - range_min
+
+    q = (
+        _range
+        * torch.randn(
+            batch_size,
+            seqlen_q,
+            nheads,
+            d,
+            device=device,
+            dtype=dtype_init,
+            requires_grad=True,
+        )
+        + range_min
+    )
+    k = (
+        _range
+        * torch.randn(
+            batch_size,
+            seqlen_q,
+            nheads,
+            d,
+            device=device,
+            dtype=dtype_init,
+            requires_grad=True,
+        )
+        + range_min
+    )
+    v = torch.rand(
+        batch_size,
+        seqlen_k,
+        nheads_kv,
+        d,
+        device=device,
+        dtype=dtype_init,
+        requires_grad=True,
+    )
+
+    # from fbgemm_gpu.experimental.gemm.triton_gemm.fp8_gemm import (
+    #     quantize_fp8_row,
+    # )
+
+    # # q = q.to(dtype)
+    # # k = k.to(dtype)
+    # # v = v.to(dtype)
+
+    # # softmax_scale = q.shape[-1] ** (-0.5)
+    # # descale_q = torch.ones([batch_size, nheads, seqlen_q], dtype=torch.float32, device="cuda")
+    # # descale_k = torch.ones([batch_size, nheads_kv, seqlen_k], dtype=torch.float32, device="cuda")
+    # # descale_k = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+    # # descale_v = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+
+    # Q: (B, M, H, D)
+    # Q_Scale: (B, M, H)
+    q_fp8, q_scale_rg = quantize_fp8_row(q, use_triton=True)
+    k_fp8, k_scale_rg = quantize_fp8_row(k, use_triton=True)
+    # # q_fp8 = q.to(dtype)
+    # # k_fp8 = k.to(dtype)
+    v_fp8 = v.to(dtype)
+
+    # q_scale = torch.ones_like(q_scale, dtype=torch.float32)
+    # k_scale = torch.ones_like(k_scale, dtype=torch.float32)
+
+    # q_scale = torch.zeros_like(q_scale)
+    # k_scale = torch.zeros_like(k_scale)
+
+    q_fake = (q_fp8.to(torch.float32) * q_scale_rg.unsqueeze(-1)).to(dtype_init)
+    k_fake = (k_fp8.to(torch.float32) * k_scale_rg.unsqueeze(-1)).to(dtype_init)
+    # q_fake = q_fp8.to(dtype_init)
+    # k_fake = k_fp8.to(dtype_init)
+    v_fake = v_fp8.to(dtype_init)
+
+    # # print(q_fake, k_fake, v_fake)
+
+    # # B_M, H
+    q_scale = q_scale_rg.reshape(-1, q_fp8.shape[-2])
+    k_scale = k_scale_rg.reshape(-1, k_fp8.shape[-2])
+
+    # batch_size, seqlen_q, nheads, d = q.shape
+    # batch_size, seqlen_k, nheads_kv, d = k.shape
+
+    # q_descale = q_scale.view(batch_size, seqlen_q, -1, 1)
+    # k_descale = k_scale.view(batch_size, seqlen_k, -1, 1)
+    # q_fake2 = (q_fp8.float() * q_descale).to(dtype=q.dtype)
+    # k_fake2 = (k_fp8.float() * k_descale).to(dtype=k.dtype)
+
+    # bid = 1
+    # bid_h = 5
+
+    # for idx in range(seqlen_q):
+    #     assert q_scale[bid * seqlen_q + idx][bid_h] == q_scale_rg[bid][idx][bid_h]
+    #     assert k_scale[bid * seqlen_k + idx][bid_h] == k_scale_rg[bid][idx][bid_h]
+
+    # print("passed", q_scale.stride(0), q_scale.stride(1))
+
+    # print(q_fake[-1][-1][-1])
+    # print(q_fake2[-1][-1][-1])
+
+    # q_scale = torch.ones([batch_size*seqlen_q, nheads], dtype=torch.float32, device="cuda")
+    # k_scale = torch.ones([batch_size*seqlen_k, nheads_kv], dtype=torch.float32, device="cuda")
+
+    q_scale_ones = torch.ones_like(q_scale)
+    k_scale_ones = torch.ones_like(k_scale)
+
+    print("Q strides:", q_scale.stride(0), q_scale.stride(1))
+    print("K strides:", k_scale.stride(0), k_scale.stride(1))
+
+    # for idx, (batch_idx, row_idx, head_idx) in enumerate(product(range(batch_size), range(seqlen_q), range(nheads))):
+    #     q_scale[batch_idx*seqlen_q + row_idx][head_idx] = idx * 1.0
+    #     k_scale[batch_idx*seqlen_k + row_idx][head_idx] = idx * 1.0
+
+        # print(q_scale[batch_idx*seqlen_q + row_idx][head_idx], idx * 1.0)
+    
+
+    def get_scale(scale_tensor, idx, seqlen, bidx, nheads):
+        return scale_tensor[bidx * seqlen + idx][nheads]
+    
+    # print(f"{get_scale(q_scale, 8, seqlen_q, 0, 2)=}")
+    # print(f"{get_scale(k_scale, 8, seqlen_k, 0, 2)=}")
+    # breakpoint()
+
+    # return
+    # print(f"{get_scale(q_scale, 161, seqlen_q, 1, 5)=}")
+
+# get_scale(q_scale, 168, seqlen_q, 1, 5)=tensor(0.0114, device='cuda:0', grad_fn=<SelectBackward0>)
+# get_scale(k_scale, 392, seqlen_q, 1, 5)=tensor(0.0126, device='cuda:0', grad_fn=<SelectBackward0>)
+# get_scale(q_scale, 161, seqlen_q, 1, 5)=tensor(0.0152, device='cuda:0', grad_fn=<SelectBackward0>)
+ 
+    print("======== [START] flash_attn_fp8_qk_rowwise_scaling =========")
+    out, lse = flash_attn_func(
+        q_fp8,
+        k.to(dtype),
+        v.to(dtype),
+        causal=causal,
+        window_size=window_size,
+        # deterministic=deterministic,
+        # gqa_parallel=gqa_parallel,
+        q_descale=q_scale,
+        k_descale=k_scale_ones,
+        # k_descale=torch.ones_like(k_scale),
+        # softcap=100.0,
+        # descale_v=descale_v,
+    )
+
+    # # print(q_scale)
+    # # print(k_scale)
+
+    out_cast, lse_ref = flash_attn_func(
+        q.to(dtype),
+        k.to(dtype),
+        v.to(dtype),
+        causal=causal,
+        window_size=window_size,
+        # deterministic=deterministic,
+        # gqa_parallel=gqa_parallel,
+        # q_descale=q_scale,
+        # k_descale=k_scale,
+        # k_descale=torch.ones_like(k_scale),
+        # softcap=100.0,
+        # descale_v=descale_v,
+    )
+
+    # out_ref_fake, lse_ref_bf16 = attention_ref(
+    #     q_fake,
+    #     k_fake,
+    #     v_fake,
+    #     causal=causal,
+    #     window_size=window_size,
+    #     # q_descale=q_scale,
+    #     # k_descale=k_scale,
+    #     intermediate_dtype=torch.float8_e4m3fn,
+    #     # dtype_og=dtype_init
+    # )
+
+    out_ref_bf16, lse_ref_bf16 = attention_ref(
+        q,
+        k,
+        v,
+        causal=causal,
+        window_size=window_size,
+        # q_descale=q_scale,
+        # k_descale=k_scale,
+        # intermediate_dtype=torch.float8_e4m3fn,
+        # dtype_og=dtype_init
+    )
+
+    def compute_loss(output1, output2):
+        return F.mse_loss(output1.float(), output2.float())
+
+    def _check_diff(t, t_ref, name):
+        print("----")
+        print(f"[{name}]Output max diff: {(t - t_ref).abs().max().item()}")
+        print(f"[{name}]Output mean diff: {(t - t_ref).abs().mean().item()}")
+        print(f"[{name}] MSE_LOSS: {compute_loss(t, t_ref)}")
+        # print(t[-1][-1][-1])
+        # print(t_ref[-1][-1][-1])
+        print("----")
+
+    print(out[-1][-1][-1])
+    print(out_cast[-1][-1][-1])
+    print(out_ref_bf16[-1][-1][-1])
+
+    print("---")
+
+    print(out[0][0][0])
+    print(out_cast[0][0][0])
+    print(out_ref_bf16[0][0][0])
+    # print(out_ref_fake[-1][-1][-1])
+
+    _check_diff(out, out_ref_bf16, "out")
+    # _check_diff(out_cast, out_ref_bf16, "out_cast")
+    # _check_diff(out_ref_fake, out_ref_bf16, "out_ref_bf16")
+
+
+    print("======== [END] flash_attn_fp8_qk_rowwise_scaling =========")
+
+    # # out_cast, lse = flash_attn_func(
+    # #     q.to(dtype),
+    # #     k.to(dtype),
+    # #     v.to(dtype),
+    # #     causal=causal,
+    # #     window_size=window_size,
+    # #     # deterministic=deterministic,
+    # #     # gqa_parallel=gqa_parallel,
+    # #     # q_descale=q_scale,
+    # #     # k_descale=k_scale,
+    # #     # softcap=100.0,
+    # #     # descale_v=descale_v,
+    # # )
+    # print("======== [END] flash_attn_fp8_qk_rowwise_scaling =========")
+
+    # out_ref_bf16, lse_ref_bf16 = attention_ref(
+    #     q_fake,
+    #     k_fake,
+    #     v_fake,
+    #     causal=causal,
+    #     window_size=window_size,
+    #     # q_descale=q_scale,
+    #     # k_descale=k_scale,
+    #     # intermediate_dtype=torch.float8_e4m3fn,
+    #     # dtype_og=dtype_init
+    # )
+
+    # out_ref_bf16_v2, lse_ref_bf16 = attention_ref(
+    #     q,
+    #     k,
+    #     v,
+    #     causal=causal,
+    #     window_size=window_size,
+    #     # q_descale=q_scale,
+    #     # k_descale=k_scale,
+    #     # intermediate_dtype=torch.float8_e4m3fn,
+    #     # dtype_og=dtype_init
+    # )
+
+    # # FP16 reference result
+    # out_ref_fp8_cast, lse_ref = attention_ref(
+    #     q.to(dtype),
+    #     k.to(dtype),
+    #     v.to(dtype),
+    #     causal=causal,
+    #     window_size=window_size,
+    #     # q_descale=q_scale,
+    #     # k_descale=k_scale,
+    #     intermediate_dtype=torch.float8_e4m3fn,
+    #     dtype_og=dtype_init,
+    #     upcast=True,
+    # )
+
+    # out_ref_fp8_per_row, lse_ref = attention_ref(
+    #     q_fp8,
+    #     k_fp8,
+    #     v_fp8,
+    #     causal=causal,
+    #     window_size=window_size,
+    #     q_descale=q_scale,
+    #     k_descale=k_scale,
+    #     intermediate_dtype=torch.float8_e4m3fn,
+    #     dtype_og=dtype_init,
+    #     upcast=True,
+    # )
+
+    # def compute_loss(output1, output2):
+    #     return F.mse_loss(output1.float(), output2.float())
+
+    # def _check_diff(t, t_ref, name):
+    #     print("----")
+    #     print(f"[{name}]Output max diff: {(t - t_ref).abs().max().item()}")
+    #     print(f"[{name}]Output mean diff: {(t - t_ref).abs().mean().item()}")
+    #     print(f"[{name}] MSE_LOSS: {compute_loss(t, t_ref)}")
+    #     # print(t[-1][-1][-1])
+    #     # print(t_ref[-1][-1][-1])
+    #     print("----")
+
+    # # print(out[-1][-1][-1])
+    # # print(out_cast[-1][-1][-1])
+    # # print(out_ref_bf16[-1][-1][-1])
+    # # print(out_ref_bf16_v2[-1][-1][-1])
+
+    # _check_diff(out, out_ref_bf16_v2, "out")
+    # # _check_diff(out_cast, out_ref_bf16_v2, "out_cast")
+    # _check_diff(out_ref_bf16, out_ref_bf16_v2, "out_ref_bf16")
+    # _check_diff(out_ref_fp8_cast, out_ref_bf16_v2, "out_ref_fp8_cast")
+    # _check_diff(out_ref_fp8_per_row, out_ref_bf16_v2, "out_ref_fp8")
+    # _check_diff(out, out_ref_fp8)
+    # fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+    # rtol = 2 if softcap == 0.0 else 3
+
+    # assert (out - out_ref_fp8).abs().max().item() <= rtol * (out_pt - out_ref).abs().max().item() + fwd_atol
+
+    # print("----")
+    # print(lse[-1][-1])
+    # print(lse_ref[-1][-1])

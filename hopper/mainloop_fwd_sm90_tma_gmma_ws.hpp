@@ -509,6 +509,12 @@ struct CollectiveMainloopFwdSm90 {
          int &work_idx
          ) {
 
+        // if (threadIdx.x == 0) {
+        //     cute::print("[Mainloop - LOAD] BlockIdx: (%d, %d, %d)", blockIdx.x, blockIdx.y, blockIdx.z);
+        //     // cute::print("[Mainloop - LOAD] BlockIdx: (%d, %d, %d), bm_stride: %d, hm_stride: %d\n\n",
+        //     //  blockIdx.x, blockIdx.y, blockIdx.z, get<0>(params.stride_q_descale), get<1>(params.stride_q_descale));
+        // }
+
         auto [m_block, bidh, bidb, split_idx] = block_coord;
         auto [n_block_min, n_block_max] = get_n_block_min_max(params, seqlen_info, m_block, bidb, split_idx, params.num_splits);
         // It's possible to have n_block_max <= n_block_min. Loading K can cause illegal memory access.
@@ -851,6 +857,11 @@ struct CollectiveMainloopFwdSm90 {
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
 
+        // if (threadIdx.x == 128 or threadIdx.x == 129 or threadIdx.x == 130) {
+        //     cute::print("[Mainloop - with MMA] BlockIdx: (%d, %d, %d), threadIdx.x: %d, bm_stride: %d, hm_stride: %d\n\n",
+        //     blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, get<0>(params.stride_q_descale), get<1>(params.stride_q_descale));
+        // }
+
         // can't use auto [m_block, ...] = block_coord since structured binding cannot be captured in lambda
         int const m_block = get<0>(block_coord);
         int const bidh = get<1>(block_coord);
@@ -915,21 +926,36 @@ struct CollectiveMainloopFwdSm90 {
         int const seqlen_k = seqlen_info.seqlen_k;
         int n_block = n_block_max - 1;
 
-        flash::Mask<kBlockM, kBlockN, PackGQA, TiledMma0> mask(
+	
+        float const* ptr_q_descale_base = params.ptr_q_descale == nullptr ? nullptr : params.ptr_q_descale + bidh * get<1>(params.stride_q_descale);
+        float const* ptr_k_descale_base = params.ptr_k_descale == nullptr ? nullptr : params.ptr_k_descale + bidh_kv * get<1>(params.stride_k_descale);
+
+        // if (thread_idx == 0) {
+        //     cute::print("[Mainloop - 1] BlockIdx: (%d, %d, %d), seqlen_q: %d, seqlen_k: %d, bm_stride: %d, hm_stride: %d, batch_idx: %d\n\n",
+        //      blockIdx.x, blockIdx.y, blockIdx.z, seqlen_q, seqlen_k, get<0>(params.stride_q_descale), get<1>(params.stride_q_descale), bidb);
+        // }
+
+        if (threadIdx.x == 128 or threadIdx.x == 129 or threadIdx.x == 130) {
+            cute::print("[Mainloop - Before Mask] BlockIdx: (%d, %d, %d), thread-idx: %d, bm_stride: %d, hm_stride: %d, k_bm_stride: %d, batch_idx: %d\n\n",
+            (int)blockIdx.x, (int)blockIdx.y, (int)blockIdx.z, (int)threadIdx.x, (int)get<0>(params.stride_q_descale), (int)get<1>(params.stride_q_descale), (int)get<0>(params.stride_k_descale), (int)bidb);
+        }
+
+        flash::Mask<kBlockM, kBlockN, PackGQA, TiledMma0, SeqlenInfo_t> mask(
             thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, params.sink_token_length,
-            params.qhead_per_khead_divmod
+            params.qhead_per_khead_divmod, ptr_q_descale_base, ptr_k_descale_base, bidb, get<0>(params.stride_q_descale), get<0>(params.stride_k_descale), bidh, bidh_kv
         );
 
         float softcap_val = params.softcap_val;
-        if constexpr (Has_softcap && Is_FP8) {
-            float const q_descale = params.ptr_q_descale == nullptr ? 1.0f : params.ptr_q_descale[bidb * get<0>(params.stride_q_descale) + bidh_kv * get<1>(params.stride_q_descale)];
-            float const k_descale = params.ptr_k_descale == nullptr ? 1.0f : params.ptr_k_descale[bidb * get<0>(params.stride_k_descale) + bidh_kv * get<1>(params.stride_k_descale)];
-            softcap_val *= q_descale * k_descale;
-        }
+
+        // if constexpr (Has_softcap && Is_FP8) {
+        //     float const q_descale = params.ptr_q_descale == nullptr ? 1.0f : params.ptr_q_descale[bidb * get<0>(params.stride_q_descale) + bidh_kv * get<1>(params.stride_q_descale)];
+        //     float const k_descale = params.ptr_k_descale == nullptr ? 1.0f : params.ptr_k_descale[bidb * get<0>(params.stride_k_descale) + bidh_kv * get<1>(params.stride_k_descale)];
+        //     softcap_val *= q_descale * k_descale;
+        // }
         // Softcapping needs to happen before masking since if we apply after masking, softcapping can turn
         // -inf to e.g. -50.0, which can affect the attention softmax.
         auto scoremod_premask_fn = [&](auto& tSrS) {
-            if constexpr (Has_softcap) { flash::apply_softcap(tSrS, softcap_val); }
+            // if constexpr (Has_softcap) { flash::apply_softcap(tSrS, softcap_val); }
         };
 
         auto &barrier_Q = shared_storage.pipelines.barrier_Q;
@@ -944,7 +970,7 @@ struct CollectiveMainloopFwdSm90 {
                                 params.is_rotary_interleaved, thread_idx, seqlen_q, offset_rotary);
                 Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
                 int const qhead_per_khead = !PackGQA ? 1 : params.qhead_per_khead_divmod.divisor;
-                if (params.is_rotary_interleaved) {
+                if (params.is_rotary_insterleaved) {
                     auto [tRrCos, tRrSin] = cute::conditional_return<!PackGQA>(
                         rotary.template load_cos_sin<true /*kInterleaved*/>(m_block),
                         rotary.template load_cos_sin_packgqa<true /*kInterleaved*/>(m_block, params.qhead_per_khead_divmod)
@@ -984,7 +1010,9 @@ struct CollectiveMainloopFwdSm90 {
             warpgroup_wait<0>();
             pipeline_k.consumer_release(smem_pipe_read);
             scoremod_premask_fn(tSrS);
+            
             mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
+            // mask.template apply_scale<true>(tSrS, m_block, n_block);
 
             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
             softmax.template online_softmax</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
@@ -1017,6 +1045,7 @@ struct CollectiveMainloopFwdSm90 {
                 pipeline_k.consumer_release(smem_pipe_read);  // release K
                 scoremod_premask_fn(tSrS);
                 mask_fn(tSrS, n_block);
+                // mask.template apply_scale<false>(tSrS, m_block, n_block);
                 cute::copy(softmax.template max_get_scale</*Is_first=*/false, Check_inf>(tSrS), scores_scale);
                 softmax.template online_softmax</*Is_first=*/false, Check_inf>(tSrS);
                 warpgroup_wait<0>();
@@ -1095,6 +1124,8 @@ struct CollectiveMainloopFwdSm90 {
                 pipeline_k.consumer_release(smem_pipe_read);  // release K
                 scoremod_premask_fn(tSrS);
                 mask_fn(tSrS, n_block);
+                // mask.template apply_scale<false>(tSrS, m_block, n_block);
+
                 Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
                 softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
                 if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }

@@ -188,16 +188,31 @@ public:
         using PipelineParamsVt = typename MainloopPipelineVt::Params;
         using PipelineParamsKVNew = typename MainloopPipelineKVNew::Params;
 
+        if (threadIdx.x == 128 or threadIdx.x == 129 or threadIdx.x == 130) {
+            cute::print("[Mainloop - operator()] BlockIdx: (%d, %d, %d), thread-idx: %d, bm_stride: %d, hm_stride: %d\n\n",
+            (int)blockIdx.x, (int)blockIdx.y, (int)blockIdx.z, (int)threadIdx.x, (int)get<0>(params.mainloop.stride_q_descale), (int)get<1>(params.mainloop.stride_q_descale));
+        }
+
+
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
         int const lane_predicate = cute::elect_one_sync();
         int const warp_idx = cutlass::canonical_warp_idx_sync();
 
+
+        // if (threadIdx.x == 128 or threadIdx.x == 129 or threadIdx.x == 130) {
+        //     cute::print("[Mainloop - before fetch] BlockIdx: (%d, %d, %d), thread-idx: %d, bm_stride: %d, hm_stride: %d\n\n",
+        //     blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, get<0>(params.mainloop.stride_q_descale), get<1>(params.mainloop.stride_q_descale));
+        // }
         // Issue Tma Descriptor Prefetch from a single thread
         if (warp_idx == 0 && lane_predicate) {
             CollectiveMainloop::prefetch_tma_descriptors(params.mainloop);
             CollectiveEpilogue::prefetch_tma_descriptors(params.epilogue);
         }
+        // if (threadIdx.x == 128 or threadIdx.x == 129 or threadIdx.x == 130) {
+        //     cute::print("[Mainloop - after fetch] BlockIdx: (%d, %d, %d), thread-idx: %d, bm_stride: %d, hm_stride: %d\n\n",
+        //     blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, get<0>(params.mainloop.stride_q_descale), get<1>(params.mainloop.stride_q_descale));
+        // }
 
         // Obtain warp index
         int const warp_group_thread_idx = threadIdx.x % cutlass::NumThreadsPerWarpGroup;
@@ -221,6 +236,11 @@ public:
             pipeline_params_k.consumer_arv_count = NumMmaThreads;
             pipeline_params_k.producer_arv_count = NumProducerThreads;
         }
+
+        // if (threadIdx.x == 128 or threadIdx.x == 129 or threadIdx.x == 130) {
+        //     cute::print("[Mainloop - BeforeKV] BlockIdx: (%d, %d, %d), thread-idx: %d, bm_stride: %d, hm_stride: %d\n\n",
+        //     blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, get<0>(params.mainloop.stride_q_descale), get<1>(params.mainloop.stride_q_descale));
+        // }
 
         MainloopPipelineK pipeline_k = [&] {
             if constexpr (Use_TMA_KV) {
@@ -264,6 +284,12 @@ public:
             }
         }();
 
+        // if (threadIdx.x == 128 or threadIdx.x == 129 or threadIdx.x == 130) {
+        //     cute::print("[Mainloop - KVNew] BlockIdx: (%d, %d, %d), thread-idx: %d, bm_stride: %d, hm_stride: %d\n\n",
+        //     blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, get<0>(params.mainloop.stride_q_descale), get<1>(params.mainloop.stride_q_descale));
+        // }
+
+
         PipelineParamsKVNew pipeline_params_kv_new;
         pipeline_params_kv_new.role = warp_group_idx == 0
             ? MainloopPipelineKVNew::ThreadCategory::Producer
@@ -285,8 +311,17 @@ public:
             __syncthreads();
         }
 
+        // if (threadIdx.x == 128 or threadIdx.x == 129 or threadIdx.x == 130) {
+        //     cute::print("[Mainloop - P or C] BlockIdx: (%d, %d, %d), thread-idx: %d, bm_stride: %d, hm_stride: %d\n\n",
+        //     blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, get<0>(params.mainloop.stride_q_descale), get<1>(params.mainloop.stride_q_descale));
+        // }
+
         if (warp_group_idx == 0) {  // Producer
             cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+
+            // if (threadIdx.x == 0) {
+            //         cute::print("[Device Kernel - Before Producer] bm_stride: %d, hm_stride: %d\n\n", get<0>(params.mainloop.stride_q_descale), get<1>(params.mainloop.stride_q_descale));
+            // }
 
             // The pipelines for AppendKV and main attention are different, since e.g. main attention
             // might use cp.async to load KV (if PagedKV) while AppendKV always uses TMA to load
@@ -332,11 +367,22 @@ public:
                     scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                 };
                 // pipeline_vt won't be used if we don't need to transpose V.
+                // if (threadIdx.x == 0) {
+                //         cute::print("[Device Kernel - 0] bm_stride: %d, hm_stride: %d\n\n", get<0>(params.mainloop.stride_q_descale), get<1>(params.mainloop.stride_q_descale));
+                // }
                 collective_mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
                                          shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx);
+                // if (threadIdx.x == 0) {
+                //         cute::print("[Device Kernel - 1] bm_stride: %d, hm_stride: %d\n\n", get<0>(params.mainloop.stride_q_descale), get<1>(params.mainloop.stride_q_descale));
+                // }
             }
             collective_mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
         } else {  // Consumer
+            // if (threadIdx.x == 128 or threadIdx.x == 129 or threadIdx.x == 130) {
+            //     cute::print("[Mainloop - Consumer] BlockIdx: (%d, %d, %d), threadIdx.x: %d, bm_stride: %d, hm_stride: %d\n\n",
+            //     blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, get<0>(params.mainloop.stride_q_descale), get<1>(params.mainloop.stride_q_descale));
+            // }
+
             cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
 
             TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
@@ -395,6 +441,10 @@ public:
                         // if (threadIdx.x == 128) { printf("Consumer: After sync\n"); }
                     }
                 }
+                // if (threadIdx.x == 128 or threadIdx.x == 129 or threadIdx.x == 130) {
+                //     cute::print("[Mainloop - Before MMA] BlockIdx: (%d, %d, %d), threadIdx.x: %d, bm_stride: %d, hm_stride: %d\n\n",
+                //     blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, get<0>(params.mainloop.stride_q_descale), get<1>(params.mainloop.stride_q_descale));
+                // }
                 bool tile_valid = collective_mainloop.mma(
                     params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
                     tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage);
