@@ -78,13 +78,13 @@ struct Mask {
         }
     };
 
-    template <bool Seqlenk_mask=false, bool Causal_mask=false, bool Local_mask=false,
+    template <bool Seqlenk_mask=false, bool Causal_mask=false, bool Local_mask=false, bool Scale_only=false,
         typename Engine, typename Layout>
     CUTLASS_DEVICE
     void apply(Tensor<Engine, Layout> &tSrS, const int m_block, const int n_block) const {
         static_assert(!(Causal_mask && Local_mask), "Cannot be both causal and local");
         static_assert(Layout::rank == 3, "Only support 3D Tensor");
-        if (!Seqlenk_mask && !Causal_mask && !Local_mask) { return; }
+        // if (!Seqlenk_mask && !Causal_mask && !Local_mask) { return; }
 
         auto thread_mma = TiledMma{}.get_thread_slice(thread_idx);
         auto thread0_mma = TiledMma{}.get_thread_slice(_0{});
@@ -101,6 +101,133 @@ struct Mask {
         // So we subtract the limit by the first col index of this thread (get<Col>(tScS_rowcol(_0{}, _0{})))
         int const thread_col_offset = get<Col>(tScS_rowcol(_0{}, _0{}));
         int const seqlenk_col_limit = seqlen_k - n_block * kBlockN - thread_col_offset;
+
+
+
+        // If PackGQA, we split the work of compute divmod among threads in the same row
+        static constexpr int kMmaThreadsPerRow = size<0, 0>(typename TiledMma::AtomLayoutC_TV{}); // 4
+        static_assert(cutlass::NumThreadsPerWarp % kMmaThreadsPerRow == 0);
+
+        if (ptr_q_descale_base != nullptr && ptr_k_descale_base != nullptr) {
+            #pragma unroll
+            for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
+                int const row_idx = get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM;
+                if (row_idx < seqlen_q) {
+                    const float qs = ptr_q_descale_base[(batch_idx * seqlen_q + row_idx) * bm_stride];
+                    const float ks = 1.0f;
+                    #pragma unroll
+                    for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
+                        int const col_idx = int(get<Col>(t0ScS_rowcol(m, n))) + n_block * kBlockN + thread_col_offset;
+                        if (row_idx < seqlen_q && col_idx < seqlen_k) {
+                            const float s = tSrS_rowcol(m, n);
+
+                            const float s_scaled = s * qs;
+                            tSrS_rowcol(m, n) = s_scaled;  // Modifies all elements in row m
+
+                            // CUTE_LOG(
+                            //     "[Mask - Apply] [-1] seqlen_q: %d, seqlen_k: %d, bm_stride: %d, "
+                            //     "bn_stride: %d, batch_idx: %d, bidh: %d, bidh_kv: %d, "
+                            //     "row_idx: %d, col_idx: %d, q_descale: %f, k_descale: %f, tSrS-M: %d, tSrS-N: %d, "
+                            //     "s: %f, s_scaled: %f,thread_col_offset: %d, n_block: %d, kBlockN: %d, m_block: %d, kBlockM: %d, scaleOnly: %d\n",
+                            //     (int)seqlen_q, (int)seqlen_k, (int)bm_stride, (int)bn_stride, (int)batch_idx, (int)bidh,
+                            //     (int)bidh_kv, (int)row_idx, (int)col_idx, qs, ks, (int)size<0>(tSrS_rowcol), (int)size<1>(tSrS_rowcol),
+                            //     (float)s, (float)s_scaled, (int)thread_col_offset, (int)n_block, (int)kBlockN, (int)m_block, (int)kBlockM, (int)Scale_only);
+                            // }
+                        }
+                    }
+                }
+            }
+        }
+    
+            // #pragma unroll
+            // for (int i = 0; i < size(tSrS); ++i) {
+            //     tSrS(i) = tSrS(i) * 0.0022f;
+            // }
+
+
+            // #pragma unroll
+            // for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
+            //     int const row_idx = get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM;
+            //     const float qs = ptr_q_descale_base[(batch_idx * seqlen_q + row_idx) * bm_stride];
+            //     tSrS_rowcol(m) = tSrS_rowcol(m) * qs;
+            // }
+
+                // tSrS_rowcol(m) = tSrS_rowcol(m) * 0.0022f;
+                // continue;
+
+
+                // const float s = 128.0;
+                // const float qs = 1.0;
+                // const float ks = 1.0;
+                // const int col_idx = 0;
+                // const int n = 0;
+
+                // if (true) {
+                //     CUTE_LOG(
+                //         "[Mask - Apply] seqlen_q: %d, seqlen_k: %d, bm_stride: %d, "
+                //         "bn_stride: %d, batch_idx: %d, bidh: %d, bidh_kv: %d, "
+                //         "row_idx: %d, col_idx: %d, q_descale: %f, k_descale: %f, tSrS-M: %d, tSrS-N: %d, "
+                //         "s_row: %f, thread_col_offset: %d, n_block: %d, kBlockN: %d, m_block: %d, kBlockM: %d \n",
+                //         (int)seqlen_q, (int)seqlen_k, (int)bm_stride, (int)bn_stride, (int)batch_idx, (int)bidh,
+                //         (int)bidh_kv, (int)row_idx, (int)col_idx, qs, ks, (int)size<0>(tSrS_rowcol), (int)size<1>(tSrS_rowcol),
+                //         (float)s / 128.0, (int)thread_col_offset, (int)n_block, (int)kBlockN, (int)m_block, (int)kBlockM);
+                // }
+
+
+                // A: 16x4 (8x4, 8x4) => 32 threads => (A, B, C, D)
+                // B: 4x16 (4x8, 4x8) 
+                // CUTE_LOG(
+                // "[Mask - Apply] seqlen_q: %d, seqlen_k: %d, bm_stride: %d, "
+                // "bn_stride: %d, batch_idx: %d, bidh: %d, bidh_kv: %d, "
+                // "row_idx: %d, tSrS-M: %d, tSrS-N: %d \n",
+                // (int)seqlen_q, (int)seqlen_k, (int)bm_stride, (int)bn_stride, (int)batch_idx, (int)bidh, (int)bidh_kv, (int)row_idx, (int)size<0>(tSrS_rowcol), (int)size<1>(tSrS_rowcol));
+                
+                // #pragma unroll
+                // for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
+                //     int const col_idx = int(get<Col>(t0ScS_rowcol(m, n))) + n_block * kBlockN + thread_col_offset;
+                //     if (row_idx < seqlen_q && col_idx < seqlen_k) {
+                //         const float qs = ptr_q_descale_base[(batch_idx * seqlen_q + row_idx) * bm_stride];
+                //         // const float ks = ptr_k_descale_base[(batch_idx * seqlen_k + col_idx) * bn_stride];
+                //         const float ks = 1.0;
+                //         const float s = tSrS_rowcol(m, n);
+                //         float s_scaled = 1.0;
+                //         // if (s != -INFINITY) {
+                //         //     s_scaled = s * qs * ks;
+                //         //     tSrS_rowcol(m, n) = s_scaled;
+                //         // }
+
+                //     if (true) {
+                //         CUTE_LOG(
+                //         "[Mask - Apply] seqlen_q: %d, seqlen_k: %d, bm_stride: %d, "
+                //         "bn_stride: %d, batch_idx: %d, bidh: %d, bidh_kv: %d, "
+                //         "row_idx: %d, col_idx: %d, q_descale: %f, k_descale: %f, tSrS-M: %d, tSrS-N: %d, "
+                //         "s: %f, s_scaled: %f,thread_col_offset: %d, n_block: %d, kBlockN: %d, m_block: %d, kBlockM: %d \n",
+                //         (int)seqlen_q, (int)seqlen_k, (int)bm_stride, (int)bn_stride, (int)batch_idx, (int)bidh,
+                //         (int)bidh_kv, (int)row_idx, (int)col_idx, qs, ks, (int)size<0>(tSrS_rowcol), (int)size<1>(tSrS_rowcol),
+                //         (float)s, (float)s_scaled, (int)thread_col_offset, (int)n_block, (int)kBlockN, (int)m_block, (int)kBlockM);
+                //     }
+
+                //         // if (cute::thread0()) {
+                //         //     cute::print("tScS_rowcol=");
+                //         //     cute::print(tScS_rowcol);
+                //         //     cute::print("\ntSrS_rowcol=");
+                //         //     cute::print(tSrS_rowcol);
+                //         //     printf("\nRow=%d, Col=%d\n", (int)Row, (int)Col);
+                //         //     printf("size(TiledMma)=%d\n", (int)size(TiledMma{}));
+                //         //     printf("blockDim.x=%d, blockDim.y=%d, blockDim.z=%d\n",
+                //         //             (int)blockDim.x, (int)blockDim.y, (int)blockDim.z);
+                //         //     printf("size<0>(tSrS_rowcol)=%d\n", (int)size<0>(tSrS_rowcol));
+                //         //     printf("size<1>(tSrS_rowcol)=%d\n", (int)size<1>(tSrS_rowcol));
+                //         // }
+                //     }
+                // }
+
+            // __syncthreads();
+        
+        if (Scale_only) {
+            return;
+        }
+
         if constexpr (!Causal_mask && !Local_mask) {
             if constexpr (Seqlenk_mask) {  // Just masking based on col
                 #pragma unroll
@@ -114,7 +241,7 @@ struct Mask {
         } else {  // mask based on both row and col
             if constexpr (!SwapAB) {
                 // If PackGQA, we split the work of compute divmod among threads in the same row
-                static constexpr int kMmaThreadsPerRow = size<0, 0>(typename TiledMma::AtomLayoutC_TV{});
+                static constexpr int kMmaThreadsPerRow = size<0, 0>(typename TiledMma::AtomLayoutC_TV{}); // 4
                 static_assert(cutlass::NumThreadsPerWarp % kMmaThreadsPerRow == 0);
                 static_assert(!PackGQA);
                 int mma_m_idx;
@@ -124,31 +251,76 @@ struct Mask {
                 }
                 int const causal_row_offset = 1 + seqlen_k - n_block * kBlockN - seqlen_q - thread_col_offset;
 
-                if (ptr_q_descale_base != nullptr && ptr_k_descale_base != nullptr) {
-                    #pragma unroll
-                    for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
-                        int const row_idx = get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM;
-                        #pragma unroll
-                        for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
-                            int const col_idx = int(get<Col>(t0ScS_rowcol(m, n))) + n_block * kBlockN;
-                            if (row_idx < seqlen_q) {
-                                const float qs = ptr_q_descale_base[(batch_idx * seqlen_q + row_idx) * bm_stride];
-                                // const float ks = ptr_k_descale_base[(batch_idx * seqlen_k + col_idx) * bn_stride];
-                                const float ks = 1.0;
-                                const float s = tSrS_rowcol(m, n);
-                                if (s != -INFINITY) {
-                                    tSrS_rowcol(m, n) = s * qs * ks;
-                                }
+                // if (ptr_q_descale_base != nullptr && ptr_k_descale_base != nullptr) {
+                //     #pragma unroll
+                //     for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
+                //         int const row_idx = get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM;
 
-                                CUTE_LOG(
-                                    "[Mask - Apply] seqlen_q: %d, seqlen_k: %d, bm_stride: %d, "
-                                    "bn_stride: %d, batch_idx: %d, bidh: %d, bidh_kv: %d, "
-                                    "row_idx: %d, col_idx: %d, q_descale: %f, k_descale: %f, tSrS-M: %d, tSrS-N: %d \n",
-                                    (int)seqlen_q, (int)seqlen_k, (int)bm_stride, (int)bn_stride, (int)batch_idx, (int)bidh, (int)bidh_kv, (int)row_idx, (int)col_idx, qs, ks, (int)size<0>(tSrS_rowcol), (int)size<1>(tSrS_rowcol));
-                            }
-                        }
-                    }
-                }
+                //         const float s = 128.0;
+                //         const float qs = 1.0;
+                //         const float ks = 1.0;
+                //         const int col_idx = 0;
+                //         const int n = 0;
+
+                //         // if (true) {
+                //         //     CUTE_LOG(
+                //         //         "[Mask - Apply] seqlen_q: %d, seqlen_k: %d, bm_stride: %d, "
+                //         //         "bn_stride: %d, batch_idx: %d, bidh: %d, bidh_kv: %d, "
+                //         //         "row_idx: %d, col_idx: %d, q_descale: %f, k_descale: %f, tSrS-M: %d, tSrS-N: %d, "
+                //         //         "s_row: %f, thread_col_offset: %d, n_block: %d, kBlockN: %d, m_block: %d, kBlockM: %d \n",
+                //         //         (int)seqlen_q, (int)seqlen_k, (int)bm_stride, (int)bn_stride, (int)batch_idx, (int)bidh,
+                //         //         (int)bidh_kv, (int)row_idx, (int)col_idx, qs, ks, (int)size<0>(tSrS_rowcol), (int)size<1>(tSrS_rowcol),
+                //         //         (float)s / 128.0, (int)thread_col_offset, (int)n_block, (int)kBlockN, (int)m_block, (int)kBlockM);
+                //         // }
+
+
+                //         // A: 16x4 (8x4, 8x4) => 32 threads => (A, B, C, D)
+                //         // B: 4x16 (4x8, 4x8) 
+                //         // CUTE_LOG(
+                //         // "[Mask - Apply] seqlen_q: %d, seqlen_k: %d, bm_stride: %d, "
+                //         // "bn_stride: %d, batch_idx: %d, bidh: %d, bidh_kv: %d, "
+                //         // "row_idx: %d, tSrS-M: %d, tSrS-N: %d \n",
+                //         // (int)seqlen_q, (int)seqlen_k, (int)bm_stride, (int)bn_stride, (int)batch_idx, (int)bidh, (int)bidh_kv, (int)row_idx, (int)size<0>(tSrS_rowcol), (int)size<1>(tSrS_rowcol));
+                        
+                //         #pragma unroll
+                //         for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
+                //             int const col_idx = int(get<Col>(tScS_rowcol(m, n))) + n_block * kBlockN + thread_col_offset;
+                //             if (row_idx < seqlen_q) {
+                //                 const float qs = ptr_q_descale_base[(batch_idx * seqlen_q + row_idx) * bm_stride];
+                //                 // const float ks = ptr_k_descale_base[(batch_idx * seqlen_k + col_idx) * bn_stride];
+                //                 const float ks = 1.0;
+                //                 const float s = tSrS_rowcol(m, n);
+                //                 if (s != -INFINITY) {
+                //                     tSrS_rowcol(m, n) = s * qs * ks;
+                //                 }
+
+                //             if (row_idx == 0 or row_idx ==1) {
+                //                 CUTE_LOG(
+                //                 "[Mask - Apply] seqlen_q: %d, seqlen_k: %d, bm_stride: %d, "
+                //                 "bn_stride: %d, batch_idx: %d, bidh: %d, bidh_kv: %d, "
+                //                 "row_idx: %d, col_idx: %d, q_descale: %f, k_descale: %f, tSrS-M: %d, tSrS-N: %d, "
+                //                 "s_row: %f, thread_col_offset: %d, n_block: %d, kBlockN: %d, m_block: %d, kBlockM: %d \n",
+                //                 (int)seqlen_q, (int)seqlen_k, (int)bm_stride, (int)bn_stride, (int)batch_idx, (int)bidh,
+                //                 (int)bidh_kv, (int)row_idx, (int)col_idx, qs, ks, (int)size<0>(tSrS_rowcol), (int)size<1>(tSrS_rowcol),
+                //                 (float)s / 128.0, (int)thread_col_offset, (int)n_block, (int)kBlockN, (int)m_block, (int)kBlockM);
+                //             }
+
+                //                 // if (cute::thread0()) {
+                //                 //     cute::print("tScS_rowcol=");
+                //                 //     cute::print(tScS_rowcol);
+                //                 //     cute::print("\ntSrS_rowcol=");
+                //                 //     cute::print(tSrS_rowcol);
+                //                 //     printf("\nRow=%d, Col=%d\n", (int)Row, (int)Col);
+                //                 //     printf("size(TiledMma)=%d\n", (int)size(TiledMma{}));
+                //                 //     printf("blockDim.x=%d, blockDim.y=%d, blockDim.z=%d\n",
+                //                 //             (int)blockDim.x, (int)blockDim.y, (int)blockDim.z);
+                //                 //     printf("size<0>(tSrS_rowcol)=%d\n", (int)size<0>(tSrS_rowcol));
+                //                 //     printf("size<1>(tSrS_rowcol)=%d\n", (int)size<1>(tSrS_rowcol));
+                //                 // }
+                //             }
+                //         }
+                //     }
+                // }
 
                 if constexpr (Causal_mask) {
                     #pragma unroll
@@ -295,7 +467,8 @@ struct Mask {
 
     template <bool Seqlenk_mask, typename Engine, typename Layout>
     CUTLASS_DEVICE
-    void apply_scale(Tensor<Engine, Layout> &tSrS, const int m_block, const int n_block) const {
+    void apply_scale(Tensor<Engine, Layout> &tSrS, const int m_block, const int n_block, const int logdix = 0) const {
+        return;
         static_assert(Layout::rank == 3, "Only support 3D Tensor");
 
         auto thread_mma = TiledMma{}.get_thread_slice(thread_idx);
@@ -323,22 +496,30 @@ struct Mask {
 
         #pragma unroll
         for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
-            int const row_idx = !PackGQA
-                ? get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM
-                :  __shfl_sync(0xffffffff, mma_m_idx, m % kMmaThreadsPerRow, kMmaThreadsPerRow);
-            int const col_limit_right = !Seqlenk_mask
-                ? row_idx + causal_row_offset
-                : __viaddmin_s32(row_idx, causal_row_offset, seqlenk_col_limit);
-            #pragma unroll
-            for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
-                int const col_idx = int(get<Col>(t0ScS_rowcol(m, n)));
-                if (row_idx < seqlen_q && col_idx < seqlen_k && ptr_q_descale_base != nullptr && ptr_k_descale_base != nullptr) {
-                    const auto s = tSrS_rowcol(m, n);
-                    if (s != -INFINITY) {
-                        const auto qs = ptr_q_descale_base[(batch_idx * seqlen_q + row_idx) * bm_stride];
-                        const auto ks = ptr_k_descale_base[(batch_idx * seqlen_k + col_idx) * bn_stride];
-                        tSrS_rowcol(m, n) = s * qs * ks;
+            int const row_idx = get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM;
+            if (row_idx < seqlen_q) {
+                float  qs = -1.0f;
+                if (ptr_q_descale_base != nullptr) {
+                    qs = ptr_q_descale_base[(batch_idx * seqlen_q + row_idx) * bm_stride];
+                }
+                #pragma unroll
+                for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
+                    int const col_idx = int(get<Col>(t0ScS_rowcol(m, n))) + n_block * kBlockN + thread_col_offset;
+                    const float ks = 1.0f;
+                    const float s = tSrS_rowcol(m, n);
+                    // tSrS_rowcol(m, n) = tSrS_rowcol(m, n) * qs;  // Modifies all elements in row m
+
+                    if (row_idx < seqlen_q && col_idx < seqlen_k) {
+                        CUTE_LOG(
+                            "[Mask - Apply][%d] seqlen_q: %d, seqlen_k: %d, bm_stride: %d, "
+                            "bn_stride: %d, batch_idx: %d, bidh: %d, bidh_kv: %d, "
+                            "row_idx: %d, col_idx: %d, q_descale: %f, k_descale: %f, tSrS-M: %d, tSrS-N: %d, "
+                            "s_row: %f, thread_col_offset: %d, n_block: %d, kBlockN: %d, m_block: %d, kBlockM: %d \n",
+                            (int)logdix, (int)seqlen_q, (int)seqlen_k, (int)bm_stride, (int)bn_stride, (int)batch_idx, (int)bidh,
+                            (int)bidh_kv, (int)row_idx, (int)col_idx, qs, ks, (int)size<0>(tSrS_rowcol), (int)size<1>(tSrS_rowcol),
+                            (float)s, (int)thread_col_offset, (int)n_block, (int)kBlockN, (int)m_block, (int)kBlockM);
                     }
+
                 }
             }
         }

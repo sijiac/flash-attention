@@ -3,6 +3,8 @@ import itertools
 import math
 import os
 
+from itertools import product
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -19,8 +21,6 @@ from flash_attn_interface import (
 
 from padding import pad_input, unpad_input
 from test_util import attention_ref, generate_qkv, generate_random_padding_mask
-
-from itertools import product
 
 
 DISABLE_BACKWARD = os.getenv("FLASH_ATTENTION_DISABLE_BACKWARD", "FALSE") == "TRUE"
@@ -1342,7 +1342,7 @@ def quantize_fp8_row(
 
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha"])
-@pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("deterministic", [True])
 @pytest.mark.parametrize("gqa_parallel", [False])
@@ -1357,16 +1357,16 @@ def quantize_fp8_row(
         # (113, 203),
         # (128, 217),
         # (113, 211),
-        # (108, 256),
-        # (256, 512),
-        # (384, 256),
-        # (640, 128),
-        # (512, 256),
-        (128, 128),
-        # (1023, 1024),
-        # (1024, 1023),
-        # (4096, 4096),
-        # (4224, 4224),
+        (108, 256),
+        (256, 512),
+        (384, 256),
+        (640, 128),
+        (512, 256),
+        (500, 500),
+        (1023, 1024),
+        (1024, 1023),
+        (4096, 4096),
+        (4224, 4224),
     ],
 )
 def test_flash_attn_fp8_rowwise_scaling(
@@ -1390,53 +1390,65 @@ def test_flash_attn_fp8_rowwise_scaling(
     torch.random.manual_seed(42)
     # batch_size = 40
     # nheads = 16
-    batch_size = 4
-    nheads = 4
-    nheads_kv = 4 if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
+    batch_size = 1
+    nheads = 1
+    nheads_kv = 1 if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
     # nheads_kv = 1
     # batch_size = 9
     # nheads = 6
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
-    range_min = -1.0
-    range_max = 1.0
+    range_min = -10.0
+    range_max = 10.0
     _range = range_max - range_min
 
+    values = torch.tensor([-1.0, 1.0], device="cuda")  # Allowed values
+
     q = (
-        _range
-        * torch.randn(
-            batch_size,
+        values[torch.randint(
+            0,
+            len(values),
+            (batch_size,
             seqlen_q,
             nheads,
-            d,
+            d),
             device=device,
-            dtype=dtype_init,
-            requires_grad=True,
-        )
-        + range_min
+        )].to(dtype_init)
     )
     k = (
-        _range
-        * torch.randn(
-            batch_size,
+        values[torch.randint(
+            0,
+            len(values),
+            (batch_size,
             seqlen_q,
             nheads,
-            d,
+            d),
             device=device,
-            dtype=dtype_init,
-            requires_grad=True,
-        )
-        + range_min
+        )].to(dtype_init)
     )
-    v = torch.rand(
-        batch_size,
-        seqlen_k,
-        nheads_kv,
-        d,
-        device=device,
-        dtype=dtype_init,
-        requires_grad=True,
-    )
+    # v = torch.rand(
+    #     batch_size,
+    #     seqlen_k,
+    #     nheads_kv,
+    #     d,
+    #     device=device,
+    #     dtype=dtype_init,
+    #     requires_grad=True,
+    # )
+    v = q
+
+    # base_tensor = torch.tensor([1.0, -1.0] * 64, dtype=torch.bfloat16, device="cuda")
+
+    # print(base_tensor)
+
+    # for idx, (batch_idx, row_idx, head_idx) in enumerate(product(range(batch_size), range(seqlen_q), range(nheads))):
+    #     q[batch_idx][row_idx][head_idx] = base_tensor + row_idx * 1.0
+
+    # print(q[-1][127][-1], sum(q[-1][127][-1]) / d)
+    # print(q[-1][56][-1], sum(q[-1][56][-1]) / d)
+    # print(q[-1][37][-1], sum(q[-1][37][-1]) / d)
+
+    # return
 
     # from fbgemm_gpu.experimental.gemm.triton_gemm.fp8_gemm import (
     #     quantize_fp8_row,
@@ -1508,15 +1520,14 @@ def test_flash_attn_fp8_rowwise_scaling(
     print("K strides:", k_scale.stride(0), k_scale.stride(1))
 
     # for idx, (batch_idx, row_idx, head_idx) in enumerate(product(range(batch_size), range(seqlen_q), range(nheads))):
-    #     q_scale[batch_idx*seqlen_q + row_idx][head_idx] = idx * 1.0
-    #     k_scale[batch_idx*seqlen_k + row_idx][head_idx] = idx * 1.0
+    #     q_scale[batch_idx*seqlen_q + row_idx][head_idx] = q_scale[-1][-1][-1]
+    #     k_scale[batch_idx*seqlen_k + row_idx][head_idx] = q_scale[-1][-1][-1]
 
-        # print(q_scale[batch_idx*seqlen_q + row_idx][head_idx], idx * 1.0)
-    
+    # print(q_scale[batch_idx*seqlen_q + row_idx][head_idx], idx * 1.0)
 
     def get_scale(scale_tensor, idx, seqlen, bidx, nheads):
         return scale_tensor[bidx * seqlen + idx][nheads]
-    
+
     # print(f"{get_scale(q_scale, 8, seqlen_q, 0, 2)=}")
     # print(f"{get_scale(k_scale, 8, seqlen_k, 0, 2)=}")
     # breakpoint()
@@ -1524,10 +1535,13 @@ def test_flash_attn_fp8_rowwise_scaling(
     # return
     # print(f"{get_scale(q_scale, 161, seqlen_q, 1, 5)=}")
 
-# get_scale(q_scale, 168, seqlen_q, 1, 5)=tensor(0.0114, device='cuda:0', grad_fn=<SelectBackward0>)
-# get_scale(k_scale, 392, seqlen_q, 1, 5)=tensor(0.0126, device='cuda:0', grad_fn=<SelectBackward0>)
-# get_scale(q_scale, 161, seqlen_q, 1, 5)=tensor(0.0152, device='cuda:0', grad_fn=<SelectBackward0>)
- 
+    # get_scale(q_scale, 168, seqlen_q, 1, 5)=tensor(0.0114, device='cuda:0', grad_fn=<SelectBackward0>)
+    # get_scale(k_scale, 392, seqlen_q, 1, 5)=tensor(0.0126, device='cuda:0', grad_fn=<SelectBackward0>)
+    # get_scale(q_scale, 161, seqlen_q, 1, 5)=tensor(0.0152, device='cuda:0', grad_fn=<SelectBackward0>)
+
+    # print(q_fp8)
+    # print(q_scale)
+
     print("======== [START] flash_attn_fp8_qk_rowwise_scaling =========")
     out, lse = flash_attn_func(
         q_fp8,
@@ -1543,6 +1557,8 @@ def test_flash_attn_fp8_rowwise_scaling(
         # softcap=100.0,
         # descale_v=descale_v,
     )
+
+    print("================BREALINE=================")
 
     # # print(q_scale)
     # # print(k_scale)
@@ -1562,17 +1578,17 @@ def test_flash_attn_fp8_rowwise_scaling(
         # descale_v=descale_v,
     )
 
-    # out_ref_fake, lse_ref_bf16 = attention_ref(
-    #     q_fake,
-    #     k_fake,
-    #     v_fake,
-    #     causal=causal,
-    #     window_size=window_size,
-    #     # q_descale=q_scale,
-    #     # k_descale=k_scale,
-    #     intermediate_dtype=torch.float8_e4m3fn,
-    #     # dtype_og=dtype_init
-    # )
+    out_ref_fake, lse_ref_bf16 = attention_ref(
+        q_fake,
+        k_fake,
+        v_fake,
+        causal=causal,
+        window_size=window_size,
+        # q_descale=q_scale,
+        # k_descale=k_scale,
+        intermediate_dtype=torch.float8_e4m3fn,
+        # dtype_og=dtype_init
+    )
 
     out_ref_bf16, lse_ref_bf16 = attention_ref(
         q,
@@ -1586,6 +1602,18 @@ def test_flash_attn_fp8_rowwise_scaling(
         # dtype_og=dtype_init
     )
 
+    out_ref_fp8, lse_ref_fp8 = attention_ref(
+        q_fp8,
+        k.to(dtype),
+        v.to(dtype),
+        causal=causal,
+        window_size=window_size,
+        q_descale=q_scale,
+        k_descale=k_scale_ones,
+        upcast=True,
+        intermediate_dtype=torch.float8_e4m3fn,
+    )
+
     def compute_loss(output1, output2):
         return F.mse_loss(output1.float(), output2.float())
 
@@ -1593,26 +1621,41 @@ def test_flash_attn_fp8_rowwise_scaling(
         print("----")
         print(f"[{name}]Output max diff: {(t - t_ref).abs().max().item()}")
         print(f"[{name}]Output mean diff: {(t - t_ref).abs().mean().item()}")
+        # for idx, (batch_idx, h_idx, tidx) in enumerate(
+        #     product(range(batch_size), range(nheads), range(seqlen_q))
+        # ):
+        #     print(
+        #         f"[{name}] [{batch_idx}] [{h_idx}] [{tidx}] MSE_LOSS: {compute_loss(t[batch_idx][tidx][h_idx], t_ref[batch_idx][tidx][h_idx])}"
+        #     )
         print(f"[{name}] MSE_LOSS: {compute_loss(t, t_ref)}")
         # print(t[-1][-1][-1])
         # print(t_ref[-1][-1][-1])
         print("----")
 
-    print(out[-1][-1][-1])
-    print(out_cast[-1][-1][-1])
-    print(out_ref_bf16[-1][-1][-1])
+    # print(out[-1][-1][-1])
+    # print(out_cast[-1][-1][-1])
+    # print(out_ref_bf16[-1][-1][-1])
+    # torch.testing.assert_close(out[-1][-1][-1], out_cast[-1][-1][-1], rtol=1e-4, atol=1e-4)
+
+    # breakpoint()
 
     print("---")
 
-    print(out[0][0][0])
-    print(out_cast[0][0][0])
-    print(out_ref_bf16[0][0][0])
+    # print(out[0][0][0])
+    # print(out_cast[0][0][0])
+    # print(out_ref_bf16[0][0][0])
+
+    # print(out[0][1][0])
+    # print(out_cast[0][1][0])
+    # print(out_ref_bf16[0][1][0])
     # print(out_ref_fake[-1][-1][-1])
 
     _check_diff(out, out_ref_bf16, "out")
-    # _check_diff(out_cast, out_ref_bf16, "out_cast")
-    # _check_diff(out_ref_fake, out_ref_bf16, "out_ref_bf16")
+    _check_diff(out_cast, out_ref_bf16, "out_cast")
+    _check_diff(out_ref_fp8, out_ref_bf16, "out_ref_bf16")
 
+    # breakpoint()
+    # _check_diff(out_ref_fake, out_ref_bf16, "out_ref_bf16")
 
     print("======== [END] flash_attn_fp8_qk_rowwise_scaling =========")
 

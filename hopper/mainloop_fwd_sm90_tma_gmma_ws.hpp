@@ -955,7 +955,20 @@ struct CollectiveMainloopFwdSm90 {
         // Softcapping needs to happen before masking since if we apply after masking, softcapping can turn
         // -inf to e.g. -50.0, which can affect the attention softmax.
         auto scoremod_premask_fn = [&](auto& tSrS) {
+            // #pragma unroll
+            // for (int i = 0; i < size(tSrS); ++i) {
+            //     tSrS(i) = tSrS(i) * 0.0022f;
+            // }
+            // cute::print_tensor(tSrS);
             // if constexpr (Has_softcap) { flash::apply_softcap(tSrS, softcap_val); }
+        };
+
+        auto scoremod_premask_fn2 = [&](auto& tSrS) {
+            // #pragma unroll
+            // for (int i = 0; i < size(tSrS); ++i) {
+            //     tSrS(i) = tSrS(i) * 1.0f;
+            // }
+            // // if constexpr (Has_softcap) { flash::apply_softcap(tSrS, softcap_val); }
         };
 
         auto &barrier_Q = shared_storage.pipelines.barrier_Q;
@@ -970,7 +983,7 @@ struct CollectiveMainloopFwdSm90 {
                                 params.is_rotary_interleaved, thread_idx, seqlen_q, offset_rotary);
                 Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
                 int const qhead_per_khead = !PackGQA ? 1 : params.qhead_per_khead_divmod.divisor;
-                if (params.is_rotary_insterleaved) {
+                if (params.is_rotary_interleaved) {
                     auto [tRrCos, tRrSin] = cute::conditional_return<!PackGQA>(
                         rotary.template load_cos_sin<true /*kInterleaved*/>(m_block),
                         rotary.template load_cos_sin_packgqa<true /*kInterleaved*/>(m_block, params.qhead_per_khead_divmod)
@@ -1010,12 +1023,14 @@ struct CollectiveMainloopFwdSm90 {
             warpgroup_wait<0>();
             pipeline_k.consumer_release(smem_pipe_read);
             scoremod_premask_fn(tSrS);
+            scoremod_premask_fn2(tSrS);
             
             mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
-            // mask.template apply_scale<true>(tSrS, m_block, n_block);
-
+            mask.template apply_scale<false>(tSrS, m_block, n_block, 0);
             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
+            // mask.template apply_scale<true>(tSrS, m_block, n_block, 1);
             softmax.template online_softmax</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
+            // mask.template apply_scale<true>(tSrS, m_block, n_block, 2);
             if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
             Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMma1>(tSrS.layout()));
             Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
@@ -1044,10 +1059,13 @@ struct CollectiveMainloopFwdSm90 {
                 warpgroup_wait<1>();
                 pipeline_k.consumer_release(smem_pipe_read);  // release K
                 scoremod_premask_fn(tSrS);
+                scoremod_premask_fn2(tSrS);
                 mask_fn(tSrS, n_block);
-                // mask.template apply_scale<false>(tSrS, m_block, n_block);
+                mask.template apply_scale<false>(tSrS, m_block, n_block, 2);
                 cute::copy(softmax.template max_get_scale</*Is_first=*/false, Check_inf>(tSrS), scores_scale);
+                // mask.template apply_scale<false>(tSrS, m_block, n_block);
                 softmax.template online_softmax</*Is_first=*/false, Check_inf>(tSrS);
+                // mask.template apply_scale<false>(tSrS, m_block, n_block);
                 warpgroup_wait<0>();
                 pipeline_v.consumer_release(smem_pipe_read_v);  // release V
                 if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
@@ -1077,10 +1095,10 @@ struct CollectiveMainloopFwdSm90 {
                 ? n_block_min
                 : std::max(n_block_min,
                            cute::ceil_div(m_idx_max + seqlen_k - seqlen_q - params.window_size_left, kBlockN));
-            auto no_mask_fn = [](auto& tSrS, int n_block) { };
+            auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local, true /* Scaled Only*/>(tSrS, m_block, n_block); };
             #pragma unroll 1
             for (; n_block >= n_block_min_before_local_mask; --n_block) {
-                fwd_step(n_block, no_mask_fn, cute::false_type{} /*check_inf*/);
+                fwd_step(n_block, mask_fn, cute::false_type{} /*check_inf*/);
             }
             // Separate masking iterations on the left for local attention
             if constexpr (Is_local) {
@@ -1123,11 +1141,14 @@ struct CollectiveMainloopFwdSm90 {
                 warpgroup_wait<0>();
                 pipeline_k.consumer_release(smem_pipe_read);  // release K
                 scoremod_premask_fn(tSrS);
+                scoremod_premask_fn2(tSrS);
                 mask_fn(tSrS, n_block);
-                // mask.template apply_scale<false>(tSrS, m_block, n_block);
-
+                mask.template apply_scale<false>(tSrS, m_block, n_block);
                 Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
+                mask.template apply_scale<false>(tSrS, m_block, n_block);
                 softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
+                mask.template apply_scale<false>(tSrS, m_block, n_block);
+
                 if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
                 Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMma1>(tSrS.layout()));
                 Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
@@ -1159,7 +1180,7 @@ struct CollectiveMainloopFwdSm90 {
                 ? n_block_min
                 : std::max(n_block_min,
                            cute::ceil_div(m_idx_max + seqlen_k - seqlen_q - params.window_size_left, kBlockN));
-            auto no_mask_fn = [](auto& tSrS, int n_block) { };
+            auto no_mask_fn = [](auto& tSrS, int n_block) { cute::print("---------NO MASK is called!!!--------\n"); };
             #pragma unroll 1
             for (; n_block >= n_block_min_before_local_mask; --n_block) {
                 fwd_step(n_block, no_mask_fn, cute::false_type{} /*is_first_iter*/, cute::false_type{} /*check_inf*/);
@@ -1412,7 +1433,7 @@ struct CollectiveMainloopFwdSm90 {
             // before calling.
             cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup, static_cast<uint32_t>(FwdNamedBarriers::WarpSchedulerWG1) - 1 + flash::canonical_warp_group_idx_nosync() /*id*/);
             pipeline_k_new.consumer_release(smem_pipe_read);
-            // if (thread_idx == 0) { print_tensor(tKpK); printf("\n"); printf("seqlen_limit = %d\n", seqlen_k_new - n_block * kBlockN);}
+            // if (thread_idx == 0) { print_tensor(tKpK); printf(\n""); printf("seqlen_limit = %d\n", seqlen_k_new - n_block * kBlockN);}
         };
 
         auto store_V = [&] (int const n_block, auto const& smem_pipe_read) {

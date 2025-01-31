@@ -123,7 +123,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.leftpad_k,
     };
 
-    printf("[HOST launch tempalte] q_0: %d, q_1: %d\n\n", get<0>(mainloop_args.stride_q_descale), get<1>(mainloop_args.stride_q_descale));
+    // printf("[HOST launch tempalte] q_0: %d, q_1: %d\n\n", get<0>(mainloop_args.stride_q_descale), get<1>(mainloop_args.stride_q_descale));
 
 
     typename CollectiveEpilogue::Arguments epilogue_args {
@@ -157,7 +157,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         mainloop_args, epilogue_args, {device, params.num_sm}, scheduler_args
     });
 
-    printf("[HOST Launch Kernel Params] q_0: %d, q_1: %d\n\n", get<0>(kernel_params.mainloop.stride_q_descale), get<1>(kernel_params.mainloop.stride_q_descale));
+    // printf("[HOST Launch Kernel Params] q_0: %d, q_1: %d\n\n", get<0>(kernel_params.mainloop.stride_q_descale), get<1>(kernel_params.mainloop.stride_q_descale));
 
     dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
     dim3 block_dims = AttnKernel::get_block_shape();

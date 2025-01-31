@@ -226,24 +226,37 @@ def attention_ref(
     """
     if causal:
         window_size = (window_size[0], 0)
-    dtype_og = q.dtype
-    if upcast:
-        q, k, v = q.float(), k.float(), v.float()
-    if q_descale is not None:
-        q_descale = repeat(q_descale, "b h -> b (h g)", g = q.shape[2] // k.shape[2])
-        q = (q.float() * rearrange(q_descale, "b h -> b 1 h 1")).to(dtype=q.dtype)
-    if k_descale is not None:
-        k = (k.float() * rearrange(k_descale, "b h -> b 1 h 1")).to(dtype=k.dtype)
-    if v_descale is not None:
-        v = (v.float() * rearrange(v_descale, "b h -> b 1 h 1")).to(dtype=v.dtype)
+    dtype_og = torch.bfloat16
+    b = q.shape[0]
+    h = q.shape[2]
+    # if upcast:
+    q, k, v = q.float(), k.float(), v.float()
+    # if q_descale is not None:
+    #     q_descale = repeat(q_descale, "b h -> b (h g)", g = q.shape[2] // k.shape[2])
+    #     q = (q.float() * rearrange(q_descale, "b h -> b 1 h 1")).to(dtype=q.dtype)
+    # if k_descale is not None:
+    #     k = (k.float() * rearrange(k_descale, "b h -> b 1 h 1")).to(dtype=k.dtype)
+    # if v_descale is not None:
+    #     v = (v.float() * rearrange(v_descale, "b h -> b 1 h 1")).to(dtype=v.dtype)
     seqlen_q, seqlen_k = q.shape[1], k.shape[1]
     k = repeat(k, "b s h d -> b s (h g) d", g=q.shape[2] // k.shape[2])
     v = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
     d = q.shape[-1]
     if not reorder_ops:
         scores = torch.einsum("bthd,bshd->bhts", q / math.sqrt(d), k)
+        scores_org = torch.einsum("bthd,bshd->bhts", q, k)
     else:
         scores = torch.einsum("bthd,bshd->bhts", q, k / math.sqrt(d))
+        scores_org = torch.einsum("bthd,bshd->bhts", q, k)
+
+    scores = scores_org
+    if q_descale is not None:
+        scores = scores * q_descale.reshape(b, -1, h).transpose(1, 2).unsqueeze(-1)
+    if k_descale is not None:
+        scores = scores * k_descale.reshape(b, -1, h).transpose(1, 2).unsqueeze(-2)
+
+    scores /= math.sqrt(d)
+
     if softcap > 0:
         scores = torch.tanh(scores / softcap) * softcap
     if key_padding_mask is not None:
@@ -281,7 +294,7 @@ def attention_ref(
     else:
         attention_drop = attention
     if intermediate_dtype is not None:
-        attention_drop = attention_drop.to(intermediate_dtype).to(attention_drop.dtype)
+        attention_drop = attention_drop.to(intermediate_dtype).to(v.dtype)
     output = torch.einsum("bhts,bshd->bthd", attention_drop, v * dropout_scaling)
     if query_padding_mask is not None:
         output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
