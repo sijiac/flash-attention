@@ -56,7 +56,7 @@ struct Mask {
     CUTLASS_DEVICE
     Mask(const int thread_idx, const int seqlen_q, const int seqlen_k,
          const int window_size_left, const int window_size_right, const int sink_token_length,
-         cutlass::FastDivmod const &qhead_per_khead_divmod, float const * ptr_q_descale_base, float const * ptr_k_descale_base, int const batch_idx, int64_t const bm_stride, int64_t const bn_stride, int const bidh, int const bidh_kv)
+         cutlass::FastDivmod const &qhead_per_khead_divmod, float const * ptr_q_descale_base, float const * ptr_k_descale_base, int const batch_idx, int64_t const bm_stride, int64_t const bn_stride, int const bidh, int const bidh_kv, const SeqlenInfo_t* seqlen_info)
         : thread_idx(thread_idx)
         , seqlen_q(seqlen_q)
         , seqlen_k(seqlen_k)
@@ -71,6 +71,7 @@ struct Mask {
         , bn_stride(bn_stride)
         , bidh(bidh)
         , bidh_kv(bidh_kv)
+        , seqlen_info(seqlen_info)
     {
         if (thread_idx == 0 or threadIdx.x == 128 or threadIdx.x == 129 or threadIdx.x == 130) {
             cute::print("[Mask - construct] BlockIdx: (%d, %d, %d), thread-idx: %d | seqlen_q: %d, seqlen_k: %d, bm_stride: %d, bn_stride: %d, batch_idx: %d\n\n",
@@ -113,7 +114,13 @@ struct Mask {
             for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
                 int const row_idx = get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM;
                 if (row_idx < seqlen_q) {
-                    const float qs = ptr_q_descale_base[(batch_idx * seqlen_q + row_idx) * bm_stride];
+                    float qs = 1.0f;
+                    if (seqlen_info != nullptr) {
+                        qs = ptr_q_descale_base[(seqlen_info->offset_q + row_idx) * bm_stride];
+                    }
+                    else{
+                        qs = ptr_q_descale_base[(batch_idx * seqlen_q + row_idx) * bm_stride];
+                    }
                     const float ks = 1.0f;
                     #pragma unroll
                     for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
@@ -129,10 +136,9 @@ struct Mask {
                             //     "bn_stride: %d, batch_idx: %d, bidh: %d, bidh_kv: %d, "
                             //     "row_idx: %d, col_idx: %d, q_descale: %f, k_descale: %f, tSrS-M: %d, tSrS-N: %d, "
                             //     "s: %f, s_scaled: %f,thread_col_offset: %d, n_block: %d, kBlockN: %d, m_block: %d, kBlockM: %d, scaleOnly: %d\n",
-                            //     (int)seqlen_q, (int)seqlen_k, (int)bm_stride, (int)bn_stride, (int)batch_idx, (int)bidh,
+                            //     (int)seqlen_info->offset_q, (int)seqlen_k, (int)bm_stride, (int)bn_stride, (int)batch_idx, (int)bidh,
                             //     (int)bidh_kv, (int)row_idx, (int)col_idx, qs, ks, (int)size<0>(tSrS_rowcol), (int)size<1>(tSrS_rowcol),
                             //     (float)s, (float)s_scaled, (int)thread_col_offset, (int)n_block, (int)kBlockN, (int)m_block, (int)kBlockM, (int)Scale_only);
-                            // }
                         }
                     }
                 }

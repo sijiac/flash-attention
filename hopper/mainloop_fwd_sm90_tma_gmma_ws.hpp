@@ -942,7 +942,7 @@ struct CollectiveMainloopFwdSm90 {
 
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMma0, SeqlenInfo_t> mask(
             thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, params.sink_token_length,
-            params.qhead_per_khead_divmod, ptr_q_descale_base, ptr_k_descale_base, bidb, get<0>(params.stride_q_descale), get<0>(params.stride_k_descale), bidh, bidh_kv
+            params.qhead_per_khead_divmod, ptr_q_descale_base, ptr_k_descale_base, bidb, get<0>(params.stride_q_descale), get<0>(params.stride_k_descale), bidh, bidh_kv, &seqlen_info
         );
 
         float softcap_val = params.softcap_val;

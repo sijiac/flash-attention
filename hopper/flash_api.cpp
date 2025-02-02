@@ -811,7 +811,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
             params.q_descale_batch_stride = q_descale.stride(0);
             params.q_descale_head_stride = q_descale.stride(1);
 
-            printf("[HOST] q_batch_stride: %d, head_stride: %d\n\n", q_descale.stride(0), q_descale.stride(1));
+            // printf("[HOST] q_batch_stride: %d, head_stride: %d\n\n", q_descale.stride(0), q_descale.stride(1));
 
         } else {
             params.q_descale_ptr = nullptr;

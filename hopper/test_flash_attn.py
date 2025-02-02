@@ -1358,15 +1358,15 @@ def quantize_fp8_row(
         # (128, 217),
         # (113, 211),
         (108, 256),
-        (256, 512),
-        (384, 256),
-        (640, 128),
-        (512, 256),
-        (500, 500),
-        (1023, 1024),
-        (1024, 1023),
-        (4096, 4096),
-        (4224, 4224),
+        # (256, 512),
+        # (384, 256),
+        # (640, 128),
+        # (512, 256),
+        # (500, 500),
+        # (1023, 1024),
+        # (1024, 1023),
+        # (4096, 4096),
+        # (4224, 4224),
     ],
 )
 def test_flash_attn_fp8_rowwise_scaling(
@@ -1436,6 +1436,611 @@ def test_flash_attn_fp8_rowwise_scaling(
     #     requires_grad=True,
     # )
     v = q
+
+    # base_tensor = torch.tensor([1.0, -1.0] * 64, dtype=torch.bfloat16, device="cuda")
+
+    # print(base_tensor)
+
+    # for idx, (batch_idx, row_idx, head_idx) in enumerate(product(range(batch_size), range(seqlen_q), range(nheads))):
+    #     q[batch_idx][row_idx][head_idx] = base_tensor + row_idx * 1.0
+
+    # print(q[-1][127][-1], sum(q[-1][127][-1]) / d)
+    # print(q[-1][56][-1], sum(q[-1][56][-1]) / d)
+    # print(q[-1][37][-1], sum(q[-1][37][-1]) / d)
+
+    # return
+
+    # from fbgemm_gpu.experimental.gemm.triton_gemm.fp8_gemm import (
+    #     quantize_fp8_row,
+    # )
+
+    # # q = q.to(dtype)
+    # # k = k.to(dtype)
+    # # v = v.to(dtype)
+
+    # # softmax_scale = q.shape[-1] ** (-0.5)
+    # # descale_q = torch.ones([batch_size, nheads, seqlen_q], dtype=torch.float32, device="cuda")
+    # # descale_k = torch.ones([batch_size, nheads_kv, seqlen_k], dtype=torch.float32, device="cuda")
+    # # descale_k = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+    # # descale_v = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+
+    # Q: (B, M, H, D)
+    # Q_Scale: (B, M, H)
+    q_fp8, q_scale_rg = quantize_fp8_row(q, use_triton=True)
+    k_fp8, k_scale_rg = quantize_fp8_row(k, use_triton=True)
+    # # q_fp8 = q.to(dtype)
+    # # k_fp8 = k.to(dtype)
+    v_fp8 = v.to(dtype)
+
+    # q_scale = torch.ones_like(q_scale, dtype=torch.float32)
+    # k_scale = torch.ones_like(k_scale, dtype=torch.float32)
+
+    # q_scale = torch.zeros_like(q_scale)
+    # k_scale = torch.zeros_like(k_scale)
+
+    q_fake = (q_fp8.to(torch.float32) * q_scale_rg.unsqueeze(-1)).to(dtype_init)
+    k_fake = (k_fp8.to(torch.float32) * k_scale_rg.unsqueeze(-1)).to(dtype_init)
+    # q_fake = q_fp8.to(dtype_init)
+    # k_fake = k_fp8.to(dtype_init)
+    v_fake = v_fp8.to(dtype_init)
+
+    # # print(q_fake, k_fake, v_fake)
+
+    # # B_M, H
+    q_scale = q_scale_rg.reshape(-1, q_fp8.shape[-2])
+    k_scale = k_scale_rg.reshape(-1, k_fp8.shape[-2])
+
+    # batch_size, seqlen_q, nheads, d = q.shape
+    # batch_size, seqlen_k, nheads_kv, d = k.shape
+
+    # q_descale = q_scale.view(batch_size, seqlen_q, -1, 1)
+    # k_descale = k_scale.view(batch_size, seqlen_k, -1, 1)
+    # q_fake2 = (q_fp8.float() * q_descale).to(dtype=q.dtype)
+    # k_fake2 = (k_fp8.float() * k_descale).to(dtype=k.dtype)
+
+    # bid = 1
+    # bid_h = 5
+
+    # for idx in range(seqlen_q):
+    #     assert q_scale[bid * seqlen_q + idx][bid_h] == q_scale_rg[bid][idx][bid_h]
+    #     assert k_scale[bid * seqlen_k + idx][bid_h] == k_scale_rg[bid][idx][bid_h]
+
+    # print("passed", q_scale.stride(0), q_scale.stride(1))
+
+    # print(q_fake[-1][-1][-1])
+    # print(q_fake2[-1][-1][-1])
+
+    # q_scale = torch.ones([batch_size*seqlen_q, nheads], dtype=torch.float32, device="cuda")
+    # k_scale = torch.ones([batch_size*seqlen_k, nheads_kv], dtype=torch.float32, device="cuda")
+
+    q_scale_ones = torch.ones_like(q_scale)
+    k_scale_ones = torch.ones_like(k_scale)
+
+    print("Q strides:", q_scale.stride(0), q_scale.stride(1))
+    print("K strides:", k_scale.stride(0), k_scale.stride(1))
+
+    # for idx, (batch_idx, row_idx, head_idx) in enumerate(product(range(batch_size), range(seqlen_q), range(nheads))):
+    #     q_scale[batch_idx*seqlen_q + row_idx][head_idx] = q_scale[-1][-1][-1]
+    #     k_scale[batch_idx*seqlen_k + row_idx][head_idx] = q_scale[-1][-1][-1]
+
+    # print(q_scale[batch_idx*seqlen_q + row_idx][head_idx], idx * 1.0)
+
+    def get_scale(scale_tensor, idx, seqlen, bidx, nheads):
+        return scale_tensor[bidx * seqlen + idx][nheads]
+
+    # print(f"{get_scale(q_scale, 8, seqlen_q, 0, 2)=}")
+    # print(f"{get_scale(k_scale, 8, seqlen_k, 0, 2)=}")
+    # breakpoint()
+
+    # return
+    # print(f"{get_scale(q_scale, 161, seqlen_q, 1, 5)=}")
+
+    # get_scale(q_scale, 168, seqlen_q, 1, 5)=tensor(0.0114, device='cuda:0', grad_fn=<SelectBackward0>)
+    # get_scale(k_scale, 392, seqlen_q, 1, 5)=tensor(0.0126, device='cuda:0', grad_fn=<SelectBackward0>)
+    # get_scale(q_scale, 161, seqlen_q, 1, 5)=tensor(0.0152, device='cuda:0', grad_fn=<SelectBackward0>)
+
+    # print(q_fp8)
+    # print(q_scale)
+
+    print("======== [START] flash_attn_fp8_qk_rowwise_scaling =========")
+    out, lse = flash_attn_func(
+        q_fp8,
+        k.to(dtype),
+        v.to(dtype),
+        causal=causal,
+        window_size=window_size,
+        # deterministic=deterministic,
+        # gqa_parallel=gqa_parallel,
+        q_descale=q_scale,
+        k_descale=k_scale_ones,
+        # k_descale=torch.ones_like(k_scale),
+        # softcap=100.0,
+        # descale_v=descale_v,
+    )
+
+    print("================BREALINE=================")
+
+    # # print(q_scale)
+    # # print(k_scale)
+
+    out_cast, lse_ref = flash_attn_func(
+        q.to(dtype),
+        k.to(dtype),
+        v.to(dtype),
+        causal=causal,
+        window_size=window_size,
+        # deterministic=deterministic,
+        # gqa_parallel=gqa_parallel,
+        # q_descale=q_scale,
+        # k_descale=k_scale,
+        # k_descale=torch.ones_like(k_scale),
+        # softcap=100.0,
+        # descale_v=descale_v,
+    )
+
+    out_ref_fake, lse_ref_bf16 = attention_ref(
+        q_fake,
+        k_fake,
+        v_fake,
+        causal=causal,
+        window_size=window_size,
+        # q_descale=q_scale,
+        # k_descale=k_scale,
+        intermediate_dtype=torch.float8_e4m3fn,
+        # dtype_og=dtype_init
+    )
+
+    out_ref_bf16, lse_ref_bf16 = attention_ref(
+        q,
+        k,
+        v,
+        causal=causal,
+        window_size=window_size,
+        # q_descale=q_scale,
+        # k_descale=k_scale,
+        # intermediate_dtype=torch.float8_e4m3fn,
+        # dtype_og=dtype_init
+    )
+
+    out_ref_fp8, lse_ref_fp8 = attention_ref(
+        q_fp8,
+        k.to(dtype),
+        v.to(dtype),
+        causal=causal,
+        window_size=window_size,
+        q_descale=q_scale,
+        k_descale=k_scale_ones,
+        upcast=True,
+        intermediate_dtype=torch.float8_e4m3fn,
+    )
+
+    def compute_loss(output1, output2):
+        return F.mse_loss(output1.float(), output2.float())
+
+    def _check_diff(t, t_ref, name):
+        print("----")
+        print(f"[{name}]Output max diff: {(t - t_ref).abs().max().item()}")
+        print(f"[{name}]Output mean diff: {(t - t_ref).abs().mean().item()}")
+        # for idx, (batch_idx, h_idx, tidx) in enumerate(
+        #     product(range(batch_size), range(nheads), range(seqlen_q))
+        # ):
+        #     print(
+        #         f"[{name}] [{batch_idx}] [{h_idx}] [{tidx}] MSE_LOSS: {compute_loss(t[batch_idx][tidx][h_idx], t_ref[batch_idx][tidx][h_idx])}"
+        #     )
+        print(f"[{name}] MSE_LOSS: {compute_loss(t, t_ref)}")
+        # print(t[-1][-1][-1])
+        # print(t_ref[-1][-1][-1])
+        print("----")
+
+    # print(out[-1][-1][-1])
+    # print(out_cast[-1][-1][-1])
+    # print(out_ref_bf16[-1][-1][-1])
+    # torch.testing.assert_close(out[-1][-1][-1], out_cast[-1][-1][-1], rtol=1e-4, atol=1e-4)
+
+    # breakpoint()
+
+    print("---")
+
+    # print(out[0][0][0])
+    # print(out_cast[0][0][0])
+    # print(out_ref_bf16[0][0][0])
+
+    # print(out[0][1][0])
+    # print(out_cast[0][1][0])
+    # print(out_ref_bf16[0][1][0])
+    # print(out_ref_fake[-1][-1][-1])
+
+    _check_diff(out, out_ref_bf16, "out")
+    _check_diff(out_cast, out_ref_bf16, "out_cast")
+    _check_diff(out_ref_fp8, out_ref_bf16, "out_ref_bf16")
+
+    # breakpoint()
+    # _check_diff(out_ref_fake, out_ref_bf16, "out_ref_bf16")
+
+    print("======== [END] flash_attn_fp8_qk_rowwise_scaling =========")
+
+    # # out_cast, lse = flash_attn_func(
+    # #     q.to(dtype),
+    # #     k.to(dtype),
+    # #     v.to(dtype),
+    # #     causal=causal,
+    # #     window_size=window_size,
+    # #     # deterministic=deterministic,
+    # #     # gqa_parallel=gqa_parallel,
+    # #     # q_descale=q_scale,
+    # #     # k_descale=k_scale,
+    # #     # softcap=100.0,
+    # #     # descale_v=descale_v,
+    # # )
+    # print("======== [END] flash_attn_fp8_qk_rowwise_scaling =========")
+
+    # out_ref_bf16, lse_ref_bf16 = attention_ref(
+    #     q_fake,
+    #     k_fake,
+    #     v_fake,
+    #     causal=causal,
+    #     window_size=window_size,
+    #     # q_descale=q_scale,
+    #     # k_descale=k_scale,
+    #     # intermediate_dtype=torch.float8_e4m3fn,
+    #     # dtype_og=dtype_init
+    # )
+
+    # out_ref_bf16_v2, lse_ref_bf16 = attention_ref(
+    #     q,
+    #     k,
+    #     v,
+    #     causal=causal,
+    #     window_size=window_size,
+    #     # q_descale=q_scale,
+    #     # k_descale=k_scale,
+    #     # intermediate_dtype=torch.float8_e4m3fn,
+    #     # dtype_og=dtype_init
+    # )
+
+    # # FP16 reference result
+    # out_ref_fp8_cast, lse_ref = attention_ref(
+    #     q.to(dtype),
+    #     k.to(dtype),
+    #     v.to(dtype),
+    #     causal=causal,
+    #     window_size=window_size,
+    #     # q_descale=q_scale,
+    #     # k_descale=k_scale,
+    #     intermediate_dtype=torch.float8_e4m3fn,
+    #     dtype_og=dtype_init,
+    #     upcast=True,
+    # )
+
+    # out_ref_fp8_per_row, lse_ref = attention_ref(
+    #     q_fp8,
+    #     k_fp8,
+    #     v_fp8,
+    #     causal=causal,
+    #     window_size=window_size,
+    #     q_descale=q_scale,
+    #     k_descale=k_scale,
+    #     intermediate_dtype=torch.float8_e4m3fn,
+    #     dtype_og=dtype_init,
+    #     upcast=True,
+    # )
+
+    # def compute_loss(output1, output2):
+    #     return F.mse_loss(output1.float(), output2.float())
+
+    # def _check_diff(t, t_ref, name):
+    #     print("----")
+    #     print(f"[{name}]Output max diff: {(t - t_ref).abs().max().item()}")
+    #     print(f"[{name}]Output mean diff: {(t - t_ref).abs().mean().item()}")
+    #     print(f"[{name}] MSE_LOSS: {compute_loss(t, t_ref)}")
+    #     # print(t[-1][-1][-1])
+    #     # print(t_ref[-1][-1][-1])
+    #     print("----")
+
+    # # print(out[-1][-1][-1])
+    # # print(out_cast[-1][-1][-1])
+    # # print(out_ref_bf16[-1][-1][-1])
+    # # print(out_ref_bf16_v2[-1][-1][-1])
+
+    # _check_diff(out, out_ref_bf16_v2, "out")
+    # # _check_diff(out_cast, out_ref_bf16_v2, "out_cast")
+    # _check_diff(out_ref_bf16, out_ref_bf16_v2, "out_ref_bf16")
+    # _check_diff(out_ref_fp8_cast, out_ref_bf16_v2, "out_ref_fp8_cast")
+    # _check_diff(out_ref_fp8_per_row, out_ref_bf16_v2, "out_ref_fp8")
+    # _check_diff(out, out_ref_fp8)
+    # fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+    # rtol = 2 if softcap == 0.0 else 3
+
+    # assert (out - out_ref_fp8).abs().max().item() <= rtol * (out_pt - out_ref).abs().max().item() + fwd_atol
+
+    # print("----")
+    # print(lse[-1][-1])
+    # print(lse_ref[-1][-1])
+
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
+@pytest.mark.parametrize("mha_type", ["mha"])
+@pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("local", [False])
+@pytest.mark.parametrize("deterministic", [True])
+@pytest.mark.parametrize("gqa_parallel", [False])
+@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("add_unused_qkv", [False])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        # (1, 1),
+        (64, 128),
+        (128, 128),
+        (256, 256),
+        (113, 203),
+        (128, 217),
+        (113, 211),
+        (16, 32),
+        (256, 512),
+        (384, 256),
+        (640, 128),
+        (512, 256),
+        (500, 500),
+        (1020, 1024),
+        (1020, 1024),
+        (4096, 4096),
+        (4224, 4224),
+    ],
+)
+def test_flash_attn_fp8_rowwise_scaling_varlen(
+    seqlen_q,
+    seqlen_k,
+    d,
+    causal,
+    local,
+    deterministic,
+    mha_type,
+    dtype,
+    gqa_parallel,
+    add_unused_qkv,
+):
+    device = "cuda"
+    dtype_init = torch.bfloat16
+    print(dtype)
+    print("causal", causal)
+    print("local", local)
+    print("gqa_parallel", gqa_parallel)
+    # set seed
+    torch.random.manual_seed(42)
+    # batch_size = 40
+    # nheads = 16
+    batch_size = 2
+    nheads = 1
+    nheads_kv = 1 if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
+    # nheads_kv = 1
+    # batch_size = 9
+    # nheads = 6
+    window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
+
+    range_min = -10.0
+    range_max = 10.0
+    _range = range_max - range_min
+
+    values = torch.tensor([-1.0, 1.0], device="cuda")  # Allowed values
+
+    q = (
+        values[torch.randint(
+            0,
+            len(values),
+            (batch_size,
+            seqlen_q,
+            nheads,
+            d),
+            device=device,
+        )].to(dtype_init)
+    )
+    k = (
+        values[torch.randint(
+            0,
+            len(values),
+            (batch_size,
+            seqlen_k,
+            nheads,
+            d),
+            device=device,
+        )].to(dtype_init)
+    )
+    
+    # v = torch.rand(
+    #     batch_size,
+    #     seqlen_k,
+    #     nheads_kv,
+    #     d,
+    #     device=device,
+    #     dtype=dtype_init,
+    #     requires_grad=True,
+    # )
+    v = k
+
+    query_padding_mask = generate_random_padding_mask(
+        seqlen_q, batch_size, device, mode="random", zero_lengths=False
+    )
+    key_padding_mask = generate_random_padding_mask(
+        seqlen_k, batch_size, device, mode="random", zero_lengths=False
+    )
+
+    def _gen_unused_masks(padding_mask, add_unused, max_seq_len, bs, device):
+        if add_unused:
+            another_mask = generate_random_padding_mask(max_seq_len, bs, device)
+            attn_mask = torch.logical_and(padding_mask, another_mask)
+            unused_mask = torch.logical_xor(
+                torch.logical_or(padding_mask, another_mask), attn_mask
+            )
+        else:
+            attn_mask = padding_mask
+            unused_mask = None
+        return attn_mask, unused_mask
+
+    query_padding_mask, query_unused_mask = _gen_unused_masks(
+        query_padding_mask, add_unused_qkv, seqlen_q, batch_size, q.device
+    )
+    key_padding_mask, key_unused_mask = _gen_unused_masks(
+        key_padding_mask, add_unused_qkv, seqlen_k, batch_size, k.device
+    )
+    
+    q, k, v = [x.detach().requires_grad_() for x in (q, k, v)]
+
+    (
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        q,
+        k,
+        v,
+        output_pad_fn,
+        dq_pad_fn,
+        dk_pad_fn,
+    ) = generate_qkv(
+        q,
+        k,
+        v,
+        query_padding_mask,
+        key_padding_mask,
+        kvpacked=False,
+        query_unused_mask=query_unused_mask,
+        key_unused_mask=key_unused_mask,
+    )
+
+    q_fp8, q_scale = quantize_fp8_row(q_unpad, use_triton=True)
+    k_fp8, k_scale = quantize_fp8_row(k_unpad, use_triton=True)
+
+
+    k_scale_ones = torch.ones_like(k_scale)
+
+    out, lse = flash_attn_varlen_func(
+        q_fp8,
+        k_unpad.to(dtype),
+        v_unpad.to(dtype),
+        causal=causal,
+        window_size=window_size,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        # deterministic=deterministic,
+        # gqa_parallel=gqa_parallel,
+        q_descale=q_scale,
+        k_descale=k_scale_ones,
+        # k_descale=torch.ones_like(k_scale),
+        # softcap=100.0,
+        # descale_v=descale_v,
+    )
+
+    out_cast, lse = flash_attn_varlen_func(
+        q_unpad.to(dtype),
+        k_unpad.to(dtype),
+        v_unpad.to(dtype),
+        causal=causal,
+        window_size=window_size,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        # deterministic=deterministic,
+        # gqa_parallel=gqa_parallel,
+        # q_descale=q_scale,
+        # k_descale=k_scale_ones,
+        # k_descale=torch.ones_like(k_scale),
+        # softcap=100.0,
+        # descale_v=descale_v,
+    )
+
+    # q_zero_masking = None
+    # if query_unused_mask is not None:
+    #     q_zero_masking = rearrange(query_unused_mask, "b s -> b s 1 1")
+
+    # out = output_pad_fn(out)
+    # if query_unused_mask is not None:
+    #     out.masked_fill_(q_zero_masking, 0.0)
+
+    # out_cast = output_pad_fn(out_cast)
+    # if query_unused_mask is not None:
+    #     out.masked_fill_(q_zero_masking, 0.0)
+
+    # print(query_padding_mask[0][:10])
+    # print(query_unused_mask[0][:10])
+    # print(query_unused_mask.shape)
+
+    out_pt, attn_pt = attention_ref(
+        q,
+        k,
+        v,
+        query_padding_mask,
+        key_padding_mask,
+        causal=causal,
+        window_size=window_size,
+    )
+
+    def compute_loss(output1, output2):
+        return F.mse_loss(output1.float(), output2.float())
+
+    def _check_diff(t, t_ref, name):
+        print("----")
+        print(f"[{name}]Output max diff: {(t - t_ref).abs().max().item()}")
+        print(f"[{name}]Output mean diff: {(t - t_ref).abs().mean().item()}")
+        # for idx, (batch_idx, h_idx, tidx) in enumerate(
+        #     product(range(batch_size), range(nheads), range(seqlen_q))
+        # ):
+        #     print(
+        #         f"[{name}] [{batch_idx}] [{h_idx}] [{tidx}] MSE_LOSS: {compute_loss(t[tidx][h_idx], t_ref[tidx][h_idx])}"
+        #     )
+        loss = compute_loss(t, t_ref)
+        # print(f"[{name}] [{add_unused_qkv}] MSE_LOSS: {loss}")
+        assert (loss <= 0.001)
+        # print(t[-1][-1][-1])
+        # print(t_ref[-1][-1][-1])
+        print("----")
+
+
+    print(f"{cu_seqlens_q=}, {seqlen_q=}, {cu_seqlens_k=}, {seqlen_k=} \n       {max_seqlen_q=}, {max_seqlen_k=} {seqused_q=} {seqused_k=}")
+    # print(out.shape)
+    # print(out_cast.shape)
+    # print(out[0][1], out.shape)
+    # print(out_cast[0][1], out_cast.shape)
+    # print(out_pt[-1][-1][-1], out_pt.shape)
+    # torch.testing.assert_close(out[-1][-1][-1], out_cast[-1][-1][-1], rtol=1e-4, atol=1e-4)
+
+    # breakpoint()
+    _check_diff(out, out_cast, "out")
+    # _check_diff(out_cast, out_pt, "out_cast")
+    
+    return
+    # # print(q_scale)
+    # # print(k_scale)
+
+    # out_cast, lse_ref = flash_attn_func(
+    #     q.to(dtype),
+    #     k.to(dtype),
+    #     v.to(dtype),
+    #     causal=causal,
+    #     window_size=window_size,
+    #     # deterministic=deterministic,
+    #     # gqa_parallel=gqa_parallel,
+    #     # q_descale=q_scale,
+    #     # k_descale=k_scale,
+    #     # k_descale=torch.ones_like(k_scale),
+    #     # softcap=100.0,
+    #     # descale_v=descale_v,
+    # )
+
+    # breakpoint()
+
+    # return
 
     # base_tensor = torch.tensor([1.0, -1.0] * 64, dtype=torch.bfloat16, device="cuda")
 
