@@ -1030,6 +1030,10 @@ struct CollectiveMainloopFwdSm90 {
             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
             // mask.template apply_scale<true>(tSrS, m_block, n_block, 1);
             softmax.template online_softmax</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
+            // get FP8 P scaling
+            // Tensor p_row_scale = softmax.template get_row_scale(tSrS);
+            // softmax.scale(tSrS, p_row_scale);
+
             // mask.template apply_scale<true>(tSrS, m_block, n_block, 2);
             if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
             Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMma1>(tSrS.layout()));
@@ -1043,6 +1047,8 @@ struct CollectiveMainloopFwdSm90 {
             }
             --n_block;
 
+            // CUTE_LOG(" [out of fwd_step] mblock=%d nblock=%d\n", m_block, n_block);
+
             // Each step does gemm0 for iter n_block, gemm1 for iter n_block + 1, and softmax for iter n_block.
             auto fwd_step = [&](int const n_block, auto mask_fn, auto check_inf_type) {
                 static constexpr bool Check_inf = decltype(check_inf_type)::value;
@@ -1055,6 +1061,9 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
                 if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_v, smem_pipe_read_v); }
                 flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma1, cute::conditional_return<Mma1_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
+                // softmax.unscale(tOrO, p_row_scale);
+                // CUTE_LOG(" [fwd_step] with in fwd_step() mblock=%d nblock=%d\n", m_block, n_block);
+
                 warp_scheduler_barrier_arrive();
                 warpgroup_wait<1>();
                 pipeline_k.consumer_release(smem_pipe_read);  // release K
@@ -1065,6 +1074,11 @@ struct CollectiveMainloopFwdSm90 {
                 cute::copy(softmax.template max_get_scale</*Is_first=*/false, Check_inf>(tSrS), scores_scale);
                 // mask.template apply_scale<false>(tSrS, m_block, n_block);
                 softmax.template online_softmax</*Is_first=*/false, Check_inf>(tSrS);
+
+                // get FP8 P scaling
+                // p_row_scale = softmax.template get_row_scale(tSrS);
+                // softmax.scale(tSrS, p_row_scale);
+
                 // mask.template apply_scale<false>(tSrS, m_block, n_block);
                 warpgroup_wait<0>();
                 pipeline_v.consumer_release(smem_pipe_read_v);  // release V
@@ -1119,6 +1133,7 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
             consumer_wait(pipeline_v, smem_pipe_read);
             flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma1, cute::conditional_return<Mma1_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+            // softmax.unscale(tOrO, p_row_scale);
             float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
             cute::copy(softmax.finalize(v_descale), scores_scale);
             warpgroup_wait<0>();

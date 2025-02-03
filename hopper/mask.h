@@ -125,10 +125,16 @@ struct Mask {
                     #pragma unroll
                     for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
                         int const col_idx = int(get<Col>(t0ScS_rowcol(m, n))) + n_block * kBlockN + thread_col_offset;
-                        if (row_idx < seqlen_q && col_idx < seqlen_k) {
+                        if (col_idx < seqlen_k) {
+                            float ks = 1.0f;
+                            if (seqlen_info != nullptr) {
+                                ks = ptr_k_descale_base[(seqlen_info->offset_k + col_idx) * bn_stride];
+                            } else {
+                                ks = ptr_k_descale_base[(batch_idx * seqlen_k + col_idx) * bn_stride];
+                            }
                             const float s = tSrS_rowcol(m, n);
 
-                            const float s_scaled = s * qs;
+                            const float s_scaled = s * qs * ks;
                             tSrS_rowcol(m, n) = s_scaled;  // Modifies all elements in row m
 
                             // CUTE_LOG(

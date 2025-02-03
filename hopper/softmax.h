@@ -82,7 +82,7 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
             // Instead of computing exp(x - max), we compute exp2(x * log_2(e) -
             // max * log_2(e)). This allows the compiler to use the ffma
             // instruction instead of fadd and fmul separately.
-            tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
+            tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled) * 448.0f;
         }
     }
 }
@@ -139,7 +139,6 @@ struct Softmax {
 
     template<typename Tensor0>
     __forceinline__ __device__ void _print(const Tensor0& scores, const int prefix) {
-        return;
         for (int mi = 0; mi < size(row_max); ++mi) {
             const float row_max_val = row_max(mi);
             const float row_sum_val = row_sum(mi);
@@ -156,8 +155,6 @@ struct Softmax {
                 }
             }
         }
-
-    
     }
 
 
@@ -168,13 +165,13 @@ struct Softmax {
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
         static_assert(CUTE_STATIC_V(size<0>(scores)) == kNRows);
 
-        _print(scores, 0);
+        // _print(scores, 0);
         flash::template scale_apply_exp2</*Scale_max=*/true, Check_inf, Max_offset>(scores, row_max, softmax_scale_log2);
-        _print(scores, 1);
+        // _print(scores, 1);
         // We don't do the reduce across threads here since we don't need to use the row_sum.
         // We do that reduce at the end when we need to normalize the softmax.
         flash::reduce_sum</*zero_init=*/Is_first, /*warp_reduce=*/false>(scores, row_sum);
-        _print(scores, 2);
+        // _print(scores, 2);
     };
 
     __forceinline__ __device__ TensorT finalize(float const final_scale=1.f) {
@@ -189,7 +186,7 @@ struct Softmax {
             scores_scale(mi) = inv_sum * final_scale;
             // For FP8, we might have scaled the output of exp by 2**8 so we need to divide sum by that amount.
             if constexpr (Max_offset != 0) {
-                static constexpr float sum_scale = 1.f / float(1 << Max_offset);
+                static constexpr float sum_scale = 1.f / 448.0f;
                 sum *= sum_scale;
             }
             row_sum(mi) = (sum == 0.f || sum != sum) ? -INFINITY : row_max(mi) * (softmax_scale_log2 * float(M_LN2)) + __logf(sum);
@@ -207,6 +204,90 @@ struct Softmax {
         for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
             #pragma unroll
             for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scores_scale(mi); }
+        }
+    };
+
+    template<typename Tensor0>
+    CUTLASS_DEVICE TensorT get_row_scale(Tensor0 const &acc_p) {
+        // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
+        Tensor scores = make_tensor(acc_p.data(), flash::convert_layout_acc_rowcol(acc_p.layout()));
+        static_assert(CUTE_STATIC_V(size<0>(scores)) == kNRows);
+
+        constexpr float kMaxFP8E4M3 = 448.0f;
+        constexpr float eps = 1e-5f;
+        
+        TensorT row_scale;
+        // First get the local max for each thread
+        #pragma unroll
+        for (int mi = 0; mi < size<0>(scores); ++mi) {
+            float max_val = 0.0f + eps;
+            #pragma unroll
+            for (int ni = 0; ni < size<1>(scores); ++ni) {
+                const float s = scores(mi, ni);
+                const float val = fabsf(s == -INFINITY ? 0.0f : s);
+                const float s_fabsf = fabsf(s);
+
+                if (s != 0.0f) {
+                    CUTE_LOG("[get_row_scale]: max_val: %f, s: %f, val: %f, mi: %d, ni: %d\n", max_val, s, val, mi, ni);
+                }
+                max_val = max(max_val, val);
+            }
+        
+            // Warp-level reduction using butterfly pattern
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+                float other = __shfl_xor_sync(0xffffffff, max_val, offset);
+                max_val = max(max_val, other);
+            }
+            row_scale(mi) = kMaxFP8E4M3 / max_val;
+
+            // CUTE_LOG("[get_row_scale after sync]: max_val: %f, mi: %d\n", max_val, mi);
+
+            // CUTE_LOG("[get_row_scale]: row_scale: %f, max_val: %f, mi: %d\n", row_scale(mi), max_val, mi);
+            // row_scale(mi) = 1.75f;
+        }
+        
+        return row_scale;
+    }
+
+
+    template<typename Tensor1>
+    __forceinline__ __device__ void scale(Tensor1 &acc_p, TensorT const &row_scale) {
+        // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
+        Tensor acc_p_rowcol = make_tensor(acc_p.data(), flash::convert_layout_acc_rowcol(acc_p.layout()));
+        static_assert(CUTE_STATIC_V(size<0>(acc_p_rowcol)) == kNRows);
+        #pragma unroll
+        for (int mi = 0; mi < size<0>(acc_p_rowcol); ++mi) {
+            #pragma unroll
+            for (int ni = 0; ni < size<1>(acc_p_rowcol); ++ni) { acc_p_rowcol(mi, ni) *= row_scale(mi);
+                const float p = acc_p_rowcol(mi, ni);
+                const float scale = row_scale(mi);
+                const float scaled_p = p * scale;
+                acc_p_rowcol(mi, ni) = p * 1.0f;
+
+                // CUTE_LOG("[scale]: p: %f, scaled_p: %f, scale: %f, mi: %d, ni: %d\n", p, scaled_p, scale, mi, ni);
+            }
+        }
+    };
+
+    template<typename Tensor1>
+    __forceinline__ __device__ void unscale(Tensor1 &acc_p, TensorT const &row_scale) {
+        // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
+        Tensor acc_p_rowcol = make_tensor(acc_p.data(), flash::convert_layout_acc_rowcol(acc_p.layout()));
+        static_assert(CUTE_STATIC_V(size<0>(acc_p_rowcol)) == kNRows);
+        #pragma unroll
+        for (int mi = 0; mi < size<0>(acc_p_rowcol); ++mi) {
+            #pragma unroll
+            for (int ni = 0; ni < size<1>(acc_p_rowcol); ++ni) { 
+                const float o = acc_p_rowcol(mi, ni);
+                const float scale = row_scale(mi);
+                const float unscaled_o = o / scale;
+                acc_p_rowcol(mi, ni) = o / 1.0f;
+                
+                
+                // CUTE_LOG("[unscale]: o: %f, unscaled_o: %f, scale: %f, mi: %d, ni: %d\n", o, unscaled_o, scale, mi, ni);
+
+            }
         }
     };
 
