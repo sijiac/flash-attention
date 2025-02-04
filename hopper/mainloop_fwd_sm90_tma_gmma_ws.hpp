@@ -935,10 +935,10 @@ struct CollectiveMainloopFwdSm90 {
         //      blockIdx.x, blockIdx.y, blockIdx.z, seqlen_q, seqlen_k, get<0>(params.stride_q_descale), get<1>(params.stride_q_descale), bidb);
         // }
 
-        if (threadIdx.x == 128 or threadIdx.x == 129 or threadIdx.x == 130) {
-            cute::print("[Mainloop - Before Mask] BlockIdx: (%d, %d, %d), thread-idx: %d, bm_stride: %d, hm_stride: %d, k_bm_stride: %d, batch_idx: %d\n\n",
-            (int)blockIdx.x, (int)blockIdx.y, (int)blockIdx.z, (int)threadIdx.x, (int)get<0>(params.stride_q_descale), (int)get<1>(params.stride_q_descale), (int)get<0>(params.stride_k_descale), (int)bidb);
-        }
+        // if (threadIdx.x == 128 or threadIdx.x == 129 or threadIdx.x == 130) {
+        //     cute::print("[Mainloop - Before Mask] BlockIdx: (%d, %d, %d), thread-idx: %d, bm_stride: %d, hm_stride: %d, k_bm_stride: %d, batch_idx: %d\n\n",
+        //     (int)blockIdx.x, (int)blockIdx.y, (int)blockIdx.z, (int)threadIdx.x, (int)get<0>(params.stride_q_descale), (int)get<1>(params.stride_q_descale), (int)get<0>(params.stride_k_descale), (int)bidb);
+        // }
 
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMma0, SeqlenInfo_t> mask(
             thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, params.sink_token_length,
@@ -954,22 +954,22 @@ struct CollectiveMainloopFwdSm90 {
         // }
         // Softcapping needs to happen before masking since if we apply after masking, softcapping can turn
         // -inf to e.g. -50.0, which can affect the attention softmax.
-        auto scoremod_premask_fn = [&](auto& tSrS) {
-            // #pragma unroll
-            // for (int i = 0; i < size(tSrS); ++i) {
-            //     tSrS(i) = tSrS(i) * 0.0022f;
-            // }
-            // cute::print_tensor(tSrS);
-            // if constexpr (Has_softcap) { flash::apply_softcap(tSrS, softcap_val); }
-        };
+        // auto scoremod_premask_fn = [&](auto& tSrS) {
+        //     // #pragma unroll
+        //     // for (int i = 0; i < size(tSrS); ++i) {
+        //     //     tSrS(i) = tSrS(i) * 0.0022f;
+        //     // }
+        //     // cute::print_tensor(tSrS);
+        //     // if constexpr (Has_softcap) { flash::apply_softcap(tSrS, softcap_val); }
+        // };
 
-        auto scoremod_premask_fn2 = [&](auto& tSrS) {
-            // #pragma unroll
-            // for (int i = 0; i < size(tSrS); ++i) {
-            //     tSrS(i) = tSrS(i) * 1.0f;
-            // }
-            // // if constexpr (Has_softcap) { flash::apply_softcap(tSrS, softcap_val); }
-        };
+        // auto scoremod_premask_fn2 = [&](auto& tSrS) {
+        //     // #pragma unroll
+        //     // for (int i = 0; i < size(tSrS); ++i) {
+        //     //     tSrS(i) = tSrS(i) * 1.0f;
+        //     // }
+        //     // // if constexpr (Has_softcap) { flash::apply_softcap(tSrS, softcap_val); }
+        // };
 
         auto &barrier_Q = shared_storage.pipelines.barrier_Q;
         if constexpr (!AppendKV) {
@@ -1018,23 +1018,17 @@ struct CollectiveMainloopFwdSm90 {
         // TODO: check the case where n_block_max <= n_block_min but there are sink tokens
         if constexpr (IntraWGOverlap) {
             Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
+            mask.preload_scale(tSrS, m_block, n_block);
             consumer_wait(pipeline_k, smem_pipe_read);
             flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
             warpgroup_wait<0>();
             pipeline_k.consumer_release(smem_pipe_read);
-            scoremod_premask_fn(tSrS);
-            scoremod_premask_fn2(tSrS);
             
+            mask.apply_qk_scale(tSrS, m_block, n_block);
             mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
-            mask.template apply_scale<false>(tSrS, m_block, n_block, 0);
             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
-            // mask.template apply_scale<true>(tSrS, m_block, n_block, 1);
             softmax.template online_softmax</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
-            // get FP8 P scaling
-            // Tensor p_row_scale = softmax.template get_row_scale(tSrS);
-            // softmax.scale(tSrS, p_row_scale);
 
-            // mask.template apply_scale<true>(tSrS, m_block, n_block, 2);
             if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
             Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMma1>(tSrS.layout()));
             Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
@@ -1055,31 +1049,23 @@ struct CollectiveMainloopFwdSm90 {
                 PipelineState smem_pipe_read_v(smem_pipe_read.index(), smem_pipe_read.phase(), smem_pipe_read.count());
                 ++smem_pipe_read;
                 Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
+                mask.preload_scale(tSrS, m_block, n_block);
                 if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_k, smem_pipe_read); }
                 warp_scheduler_barrier_sync();
                 flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
                 if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
                 if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_v, smem_pipe_read_v); }
                 flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma1, cute::conditional_return<Mma1_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
-                // softmax.unscale(tOrO, p_row_scale);
-                // CUTE_LOG(" [fwd_step] with in fwd_step() mblock=%d nblock=%d\n", m_block, n_block);
 
                 warp_scheduler_barrier_arrive();
                 warpgroup_wait<1>();
                 pipeline_k.consumer_release(smem_pipe_read);  // release K
-                scoremod_premask_fn(tSrS);
-                scoremod_premask_fn2(tSrS);
+
+                mask.apply_qk_scale(tSrS, m_block, n_block);
                 mask_fn(tSrS, n_block);
-                mask.template apply_scale<false>(tSrS, m_block, n_block, 2);
                 cute::copy(softmax.template max_get_scale</*Is_first=*/false, Check_inf>(tSrS), scores_scale);
-                // mask.template apply_scale<false>(tSrS, m_block, n_block);
                 softmax.template online_softmax</*Is_first=*/false, Check_inf>(tSrS);
 
-                // get FP8 P scaling
-                // p_row_scale = softmax.template get_row_scale(tSrS);
-                // softmax.scale(tSrS, p_row_scale);
-
-                // mask.template apply_scale<false>(tSrS, m_block, n_block);
                 warpgroup_wait<0>();
                 pipeline_v.consumer_release(smem_pipe_read_v);  // release V
                 if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
@@ -1155,14 +1141,9 @@ struct CollectiveMainloopFwdSm90 {
                 warp_scheduler_barrier_arrive();
                 warpgroup_wait<0>();
                 pipeline_k.consumer_release(smem_pipe_read);  // release K
-                scoremod_premask_fn(tSrS);
-                scoremod_premask_fn2(tSrS);
                 mask_fn(tSrS, n_block);
-                mask.template apply_scale<false>(tSrS, m_block, n_block);
                 Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
-                mask.template apply_scale<false>(tSrS, m_block, n_block);
                 softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
-                mask.template apply_scale<false>(tSrS, m_block, n_block);
 
                 if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
                 Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMma1>(tSrS.layout()));

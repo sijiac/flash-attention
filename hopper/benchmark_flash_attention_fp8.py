@@ -220,16 +220,16 @@ device = 'cuda'
 dtype = torch.float8_e4m3fn
 
 # bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4224), (2, 8448), (1, 8448 * 2)]
-bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 8192 * 2)]
+bs_seqlen_vals = [(2, 8192)]
 # bs_seqlen_vals = [(4, 4096), (2, 8192), (1, 8192 * 2)]
 # bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048)]
-causal_vals = [False, True]
-headdim_vals = [64, 128, 256]
+causal_vals = [True]
+headdim_vals = [128]
 dim = 2048
 # dim = 256
 dropout_p = 0.0
 
-methods = (["Pytorch", "Flash3"]
+methods = (["Pytorch", "Flash3", "Flash3 QK per-token"]
         + (["cuDNN"] if cudnn is not None else [])
         # + (["Triton"] if attention_triton is not None else [])
         #    + (["xformers.c"] if xops is not None else [])
@@ -279,22 +279,22 @@ for causal in causal_vals:
             # out = torch.empty_like(q)
             q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
             softmax_scale = q.shape[-1] ** (-0.5)
-            descale_q = torch.tensor([1.0], dtype=torch.float32, device='cuda')
-            descale_k = torch.tensor([1.0], dtype=torch.float32, device='cuda')
+            descale_q = torch.ones([batch_size * seqlen, nheads], dtype=torch.float32, device='cuda')
+            descale_k = torch.ones([batch_size * seqlen, nheads], dtype=torch.float32, device='cuda')
             descale_v = torch.tensor([1.0], dtype=torch.float32, device='cuda')
 
             # f = time_fwd(flash_attn_func, q, k, v, causal=causal, repeats=repeats, verbose=False)
             f = time_fwd(
-                _flash_attn_forward,
+                flash_attn_func,
                 q, 
                 k, 
                 v, 
                 softmax_scale, 
                 causal=causal,
                 window_size=(-1,-1),
-                descale_q=descale_q, 
-                descale_k=descale_k, 
-                descale_v=descale_v, 
+                # q_descale=descale_q, 
+                # k_descale=descale_k, 
+                # descale_v=descale_v, 
                 repeats=repeats, 
                 verbose=False
             )
@@ -303,6 +303,23 @@ for causal in causal_vals:
             # torch.testing.assert_close(res.half(), res_baseline, atol=0.05, rtol=0.05)
 
             time_f[config, "Flash3"] = f
+
+            f_per_token = time_fwd(
+                flash_attn_func,
+                q, 
+                k, 
+                v, 
+                softmax_scale, 
+                causal=causal,
+                window_size=(-1,-1),
+                q_descale=descale_q, 
+                k_descale=descale_k, 
+                # descale_v=descale_v, 
+                repeats=repeats, 
+                verbose=False
+            )
+
+            time_f[config, "Flash3 QK per-token"] = f_per_token
 
             if cudnn is not None:
                 qkv_fp8 = qkv.to(dtype)

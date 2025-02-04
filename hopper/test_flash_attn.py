@@ -1524,11 +1524,11 @@ def test_flash_attn_fp8_rowwise_scaling(
     print("Q strides:", q_scale.stride(0), q_scale.stride(1))
     print("K strides:", k_scale.stride(0), k_scale.stride(1))
 
-    for idx, (batch_idx, row_idx, head_idx) in enumerate(product(range(batch_size), range(seqlen_q), range(nheads))):
-        q_scale[batch_idx*seqlen_q + row_idx][head_idx] = ((batch_idx*seqlen_q + row_idx) % 10) * 1.0
+    # for idx, (batch_idx, row_idx, head_idx) in enumerate(product(range(batch_size), range(seqlen_q), range(nheads))):
+    #     q_scale[batch_idx*seqlen_q + row_idx][head_idx] = ((batch_idx*seqlen_q + row_idx) % 10) * 1.0
 
-    for idx, (batch_idx, row_idx, head_idx) in enumerate(product(range(batch_size), range(seqlen_k), range(nheads))):
-        k_scale[batch_idx*seqlen_k + row_idx][head_idx] = ((batch_idx*seqlen_k + row_idx) % 10) * 1.0
+    # for idx, (batch_idx, row_idx, head_idx) in enumerate(product(range(batch_size), range(seqlen_k), range(nheads))):
+    #     k_scale[batch_idx*seqlen_k + row_idx][head_idx] = ((batch_idx*seqlen_k + row_idx) % 10) * 1.0
 
 
     # print(q_scale[batch_idx*seqlen_q + row_idx][head_idx], idx * 1.0)
@@ -1552,8 +1552,8 @@ def test_flash_attn_fp8_rowwise_scaling(
 
     print("======== [START] flash_attn_fp8_qk_rowwise_scaling =========")
     out, lse = flash_attn_func(
-        q.to(dtype),
-        k.to(dtype),
+        q_fp8,
+        k_fp8,
         v.to(dtype),
         causal=causal,
         window_size=window_size,
