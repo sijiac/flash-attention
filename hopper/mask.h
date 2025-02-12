@@ -255,15 +255,15 @@ struct Mask {
             for (int n = 0; n < size<1>(tSrS_rowcol); ++n) { // 56 times
                 int const col_idx = int(get<Col>(t0ScS_rowcol(_0{}, n))) + n_block * kBlockN + thread_col_offset;
                 float ks = 1.0f;
-                // if (col_idx < seqlen_k) {
-                //     if (seqlen_info != nullptr) {
-                //         cutlass::arch::global_load<ElementScale, sizeof(ElementScale)>(ks, ptr_k_descale_base + (seqlen_info->offset_k + col_idx) * bn_stride, true);
-                //         // ks = ptr_k_descale_base[(seqlen_info->offset_k + col_idx) * bn_stride];
-                //     } else {
-                //         cutlass::arch::global_load<ElementScale, sizeof(ElementScale)>(ks, ptr_k_descale_base + (batch_idx * seqlen_k + col_idx) * bn_stride, true);
-                //         // ks = ptr_k_descale_base[(batch_idx * seqlen_k + col_idx) * bn_stride];
-                //     }
-                // }
+                if (col_idx < seqlen_k) {
+                    if (seqlen_info != nullptr) {
+                        cutlass::arch::global_load<ElementScale, sizeof(ElementScale)>(ks, ptr_k_descale_base + (seqlen_info->offset_k + col_idx) * bn_stride, true);
+                        // ks = ptr_k_descale_base[(seqlen_info->offset_k + col_idx) * bn_stride];
+                    } else {
+                        cutlass::arch::global_load<ElementScale, sizeof(ElementScale)>(ks, ptr_k_descale_base + (batch_idx * seqlen_k + col_idx) * bn_stride, true);
+                        // ks = ptr_k_descale_base[(batch_idx * seqlen_k + col_idx) * bn_stride];
+                    }
+                }
                 descale_k_buffer[n] = ks;
             }
             // ptr_q_descale_preload = preload_q;
@@ -276,6 +276,9 @@ struct Mask {
     void apply_qk_scale(Tensor<Engine, Layout> &tSrS, const int m_block, const int n_block) const {
         static_assert(Layout::rank == 3, "Only support 3D Tensor");
         static_assert(!SwapAB, "Only support A and B not swapped");
+
+        // // const float qs = ptr_q_descale_base[m_block * bm_stride];
+        // const float ks = ptr_k_descale_base[n_block * bn_stride];
 
         Tensor tSrS_rowcol = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SwapAB>(tSrS.layout()));
         
@@ -292,58 +295,58 @@ struct Mask {
         }
     };
 
-    template <typename Engine, typename Layout>
-    CUTLASS_DEVICE
-    void apply_qk_scale(Tensor<Engine, Layout> &tSrS, const int m_block, const int n_block) const {
-        static_assert(Layout::rank == 3, "Only support 3D Tensor");
-        static_assert(!SwapAB, "Only support A and B not swapped");
+    // template <typename Engine, typename Layout>
+    // CUTLASS_DEVICE
+    // void apply_qk_scale(Tensor<Engine, Layout> &tSrS, const int m_block, const int n_block) const {
+    //     static_assert(Layout::rank == 3, "Only support 3D Tensor");
+    //     static_assert(!SwapAB, "Only support A and B not swapped");
 
-        auto thread_mma = TiledMma{}.get_thread_slice(thread_idx);
-        auto thread0_mma = TiledMma{}.get_thread_slice(_0{});
+    //     auto thread_mma = TiledMma{}.get_thread_slice(thread_idx);
+    //     auto thread0_mma = TiledMma{}.get_thread_slice(_0{});
 
-        static constexpr int Row = !SwapAB ? 0 : 1, Col = !SwapAB ? 1 : 0;
+    //     static constexpr int Row = !SwapAB ? 0 : 1, Col = !SwapAB ? 1 : 0;
 
-        Tensor cS = cute::make_identity_tensor(Shape<Int<!SwapAB ? kBlockM : kBlockN>, Int<!SwapAB ? kBlockN : kBlockM>>{});
-        Tensor tScS = thread_mma.partition_C(cS);
-        Tensor tSrS_rowcol = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SwapAB>(tSrS.layout()));
-        Tensor tScS_rowcol = make_tensor(tScS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SwapAB>(tScS.layout()));
-        Tensor t0ScS = thread0_mma.partition_C(cS);
-        Tensor t0ScS_rowcol = make_tensor(t0ScS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SwapAB>(t0ScS.layout()));
-        // We want to use the col indices of thread0 to compare, since that is known at compile time.
-        // So we subtract the limit by the first col index of this thread (get<Col>(tScS_rowcol(_0{}, _0{})))
-        int const thread_col_offset = get<Col>(tScS_rowcol(_0{}, _0{}));
+    //     Tensor cS = cute::make_identity_tensor(Shape<Int<!SwapAB ? kBlockM : kBlockN>, Int<!SwapAB ? kBlockN : kBlockM>>{});
+    //     Tensor tScS = thread_mma.partition_C(cS);
+    //     Tensor tSrS_rowcol = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SwapAB>(tSrS.layout()));
+    //     Tensor tScS_rowcol = make_tensor(tScS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SwapAB>(tScS.layout()));
+    //     Tensor t0ScS = thread0_mma.partition_C(cS);
+    //     Tensor t0ScS_rowcol = make_tensor(t0ScS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SwapAB>(t0ScS.layout()));
+    //     // We want to use the col indices of thread0 to compare, since that is known at compile time.
+    //     // So we subtract the limit by the first col index of this thread (get<Col>(tScS_rowcol(_0{}, _0{})))
+    //     int const thread_col_offset = get<Col>(tScS_rowcol(_0{}, _0{}));
         
-        if (ptr_q_descale_base != nullptr && ptr_k_descale_base != nullptr) {
-            #pragma unroll
-            for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
-                int const row_idx = get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM;
-                if (row_idx < seqlen_q) {
-                    float qs = 1.0f;
-                    if (seqlen_info != nullptr) {
-                        qs = ptr_q_descale_base[(seqlen_info->offset_q + row_idx) * bm_stride];
-                    }
-                    else{
-                        qs = ptr_q_descale_base[(batch_idx * seqlen_q + row_idx) * bm_stride];
-                    }
-                    #pragma unroll
-                    for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
-                        int const col_idx = int(get<Col>(t0ScS_rowcol(m, n))) + n_block * kBlockN + thread_col_offset;
-                        if (col_idx < seqlen_k) {
-                            float ks = 1.0f;
-                            if (seqlen_info != nullptr) {
-                                ks = ptr_k_descale_base[(seqlen_info->offset_k + col_idx) * bn_stride];
-                            } else {
-                                ks = ptr_k_descale_base[(batch_idx * seqlen_k + col_idx) * bn_stride];
-                            }
-                            const float s = tSrS_rowcol(m, n);
-                            const float s_scaled = s * qs * ks;
-                            tSrS_rowcol(m, n) = s_scaled;  // Modifies all elements in row m
-                        }
-                    }
-                }
-            }
-        }
-    };
+    //     if (ptr_q_descale_base != nullptr && ptr_k_descale_base != nullptr) {
+    //         #pragma unroll
+    //         for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
+    //             int const row_idx = get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM;
+    //             if (row_idx < seqlen_q) {
+    //                 float qs = 1.0f;
+    //                 if (seqlen_info != nullptr) {
+    //                     qs = ptr_q_descale_base[(seqlen_info->offset_q + row_idx) * bm_stride];
+    //                 }
+    //                 else{
+    //                     qs = ptr_q_descale_base[(batch_idx * seqlen_q + row_idx) * bm_stride];
+    //                 }
+    //                 #pragma unroll
+    //                 for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
+    //                     int const col_idx = int(get<Col>(t0ScS_rowcol(m, n))) + n_block * kBlockN + thread_col_offset;
+    //                     if (col_idx < seqlen_k) {
+    //                         float ks = 1.0f;
+    //                         if (seqlen_info != nullptr) {
+    //                             ks = ptr_k_descale_base[(seqlen_info->offset_k + col_idx) * bn_stride];
+    //                         } else {
+    //                             ks = ptr_k_descale_base[(batch_idx * seqlen_k + col_idx) * bn_stride];
+    //                         }
+    //                         const float s = tSrS_rowcol(m, n);
+    //                         const float s_scaled = s * qs * ks;
+    //                         tSrS_rowcol(m, n) = s_scaled;  // Modifies all elements in row m
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     }
+    // };
 
     // template <bool Seqlenk_mask, typename Engine, typename Layout>
     // CUTLASS_DEVICE

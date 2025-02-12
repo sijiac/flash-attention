@@ -947,6 +947,9 @@ struct CollectiveMainloopFwdSm90 {
 
         float softcap_val = params.softcap_val;
 
+        Tensor tSrS_ref = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
+        mask.preload_scale(tSrS_ref, m_block, 0);
+
         // if constexpr (Has_softcap && Is_FP8) {
         //     float const q_descale = params.ptr_q_descale == nullptr ? 1.0f : params.ptr_q_descale[bidb * get<0>(params.stride_q_descale) + bidh_kv * get<1>(params.stride_q_descale)];
         //     float const k_descale = params.ptr_k_descale == nullptr ? 1.0f : params.ptr_k_descale[bidb * get<0>(params.stride_k_descale) + bidh_kv * get<1>(params.stride_k_descale)];
@@ -1018,13 +1021,13 @@ struct CollectiveMainloopFwdSm90 {
         // TODO: check the case where n_block_max <= n_block_min but there are sink tokens
         if constexpr (IntraWGOverlap) {
             Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
-            mask.preload_scale(tSrS, m_block, n_block);
+            mask.preload_scale(tSrS, m_block, n_block); // preload
             consumer_wait(pipeline_k, smem_pipe_read);
             flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
             warpgroup_wait<0>();
             pipeline_k.consumer_release(smem_pipe_read);
             
-            mask.apply_qk_scale(tSrS, m_block, n_block);
+            mask.apply_qk_scale(tSrS, m_block, n_block); // apply
             mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
             softmax.template online_softmax</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
@@ -1049,7 +1052,7 @@ struct CollectiveMainloopFwdSm90 {
                 PipelineState smem_pipe_read_v(smem_pipe_read.index(), smem_pipe_read.phase(), smem_pipe_read.count());
                 ++smem_pipe_read;
                 Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
-                mask.preload_scale(tSrS, m_block, n_block);
+                // mask.preload_scale(tSrS, m_block, n_block);
                 if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_k, smem_pipe_read); }
                 warp_scheduler_barrier_sync();
                 flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
